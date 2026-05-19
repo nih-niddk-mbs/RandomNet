@@ -24,18 +24,19 @@ def main():
     out_dir = Path(__file__).resolve().parents[1] / "plots"
     out_dir.mkdir(parents=True, exist_ok=True)
 
+    # Shared binary-network parameters. gamma, n_bar, c1 are determined by these,
+    # so expose them once here rather than implicitly fixing them in each call.
+    binary_params = dict(beta=1.0, mu=1.0, f0=0.5, f1=1.0)
+
     # 1) Single binary sigma plot
     sigma = 0.8
     tau_th, Cnn_th, _, g = mod.theory_binary_autocorr(
-        sigma=sigma, beta=1.0, mu=1.0, f0=0.5, f1=1.0, tau_max=20, dtau=0.001
+        sigma=sigma, tau_max=20, dtau=0.001, **binary_params
     )
     tau_s, Cnn_s, _ = mod.sim_binary_network(
         N=300,
         sigma=sigma,
-        beta=1.0,
-        mu=1.0,
-        f0=0.5,
-        f1=1.0,
+        **binary_params,
         T=800.0,
         dt=0.02,
         lam=1,
@@ -65,15 +66,12 @@ def main():
     fig, ax = plt.subplots(figsize=(8, 5))
     for sigma in (0.5, 0.8, 0.95):
         tau_th, Cnn_th, _, g = mod.theory_binary_autocorr(
-            sigma=sigma, beta=1.0, mu=1.0, f0=0.5, f1=1.0, tau_max=20, dtau=0.001
+            sigma=sigma, tau_max=20, dtau=0.001, **binary_params
         )
         tau_s, Cnn_s, _ = mod.sim_binary_network(
             N=300,
             sigma=sigma,
-            beta=1.0,
-            mu=1.0,
-            f0=0.5,
-            f1=1.0,
+            **binary_params,
             T=800.0,
             dt=0.02,
             lam=1,
@@ -192,28 +190,31 @@ def main():
     fig, axes = plt.subplots(1, len(link_examples), figsize=(5.2 * len(link_examples), 4.5), sharey=True)
 
     for ax, (link_name, link_fn) in zip(np.atleast_1d(axes), link_examples):
-        rate_params = dict(N=512, sigma=link_sigma, T=2200.0, dt=0.05, burn=350, lam=1, f=link_fn)
-        rate_reps = 3
+        rate_params = dict(
+            N=512,
+            sigma=link_sigma,
+            T=3200.0,
+            dt=0.05,
+            burn=500,
+            lam=1,
+            f=link_fn,
+            n_probe=256,
+        )
+        rate_reps = 4
         C_runs = []
-        c0_runs = []
         tau_s = None
         for _ in range(rate_reps):
             tau_run, C_run = mod.sim_rate_network(**rate_params)
             tau_s = tau_run
-            c0_runs.append(float(C_run[0]))
             C_runs.append(C_run / max(C_run[0], 1e-12))
         C_s = np.mean(C_runs, axis=0)
         C_s_std = np.std(C_runs, axis=0)
-        c0_mean = float(np.mean(c0_runs))
-        c0_lo = max(0.05, 0.6 * c0_mean)
-        c0_hi = max(c0_lo + 1e-6, 1.4 * c0_mean)
         tau_t, C_t = mod.theory_rate_autocorr(
             C0=None,
             sigma=link_sigma,
             tau_max=25,
             dtau=0.01,
             f=link_fn,
-            C0_bounds=(c0_lo, c0_hi),
         )
 
         ax.plot(tau_s, C_s, lw=1.8, label=f"Sim mean ({rate_reps} runs)")
@@ -226,7 +227,7 @@ def main():
             linewidth=0,
         )
         ax.plot(tau_t, C_t / max(C_t[0], 1e-12), "--", lw=2.0, label="Theory")
-        ax.set_title(f"{link_name}\n(sigma={link_sigma}, N={rate_params['N']})")
+        ax.set_title(f"{link_name}\n(sigma={link_sigma}, N={rate_params['N']}, reps={rate_reps})")
         ax.set_xlabel("tau")
         ax.set_xlim(0, 20)
         ax.grid(alpha=0.15)
@@ -240,11 +241,41 @@ def main():
     fig.savefig(p5, dpi=160)
     plt.close(fig)
 
+    # 6) Network-size invariance check (rate network).
+    # If the scaling is correct, normalized correlations should collapse as N grows.
+    N_values = (256, 512, 1024)
+    sigma_inv = 1.8
+    fig, ax = plt.subplots(figsize=(8.2, 4.8))
+    for N in N_values:
+        tau_s, C_s = mod.sim_rate_network(
+            N=N,
+            sigma=sigma_inv,
+            T=2200.0,
+            dt=0.05,
+            burn=300,
+            lam=1,
+            f=np.tanh,
+            n_probe=min(N, 256),
+        )
+        ax.plot(tau_s, C_s / max(C_s[0], 1e-12), lw=1.8, label=f"N={N}")
+
+    ax.set_xlabel("tau")
+    ax.set_ylabel("C(tau) / C(0)")
+    ax.set_title(f"Rate network size invariance check (sigma={sigma_inv})")
+    ax.set_xlim(0, 20)
+    ax.grid(alpha=0.15)
+    ax.legend()
+    fig.tight_layout()
+    p6 = out_dir / "rate_size_invariance.png"
+    fig.savefig(p6, dpi=160)
+    plt.close(fig)
+
     print(str(p1))
     print(str(p2))
     print(str(p3))
     print(str(p4))
     print(str(p5))
+    print(str(p6))
 
 
 if __name__ == "__main__":

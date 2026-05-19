@@ -47,7 +47,15 @@ def make_weights(N, sigma, lam=1, rng=rng):
 # -----------------------------------------------------------------------------
 
 def sim_rate_network(
-    N=512, sigma=1.5, T=2000.0, dt=0.05, f=np.tanh, lam=1, burn=200, rng=rng
+    N=512,
+    sigma=1.5,
+    T=2000.0,
+    dt=0.05,
+    f=np.tanh,
+    lam=1,
+    burn=200,
+    n_probe=64,
+    rng=rng,
 ):
     """
     Euler-Maruyama integration of the rate network.
@@ -78,9 +86,11 @@ def sim_rate_network(
         u += dt * (-u + W @ f(u))
         U[t] = u
 
-    # average autocorrelation over neurons
+    # Average autocorrelation over a subset of neurons.
+    # Using more probes reduces large-lag variance in finite simulations.
     max_lag = int(50 / dt)
-    C = np.mean([autocorr(U[:, i], max_lag) for i in range(min(N, 64))], axis=0)
+    n_probe = int(max(1, min(N, n_probe)))
+    C = np.mean([autocorr(U[:, i], max_lag) for i in range(n_probe)], axis=0)
     tau = np.arange(max_lag) * dt
     return tau, C
 
