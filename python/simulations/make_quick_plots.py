@@ -192,22 +192,28 @@ def main():
     fig, axes = plt.subplots(1, len(link_examples), figsize=(5.2 * len(link_examples), 4.5), sharey=True)
 
     for ax, (link_name, link_fn) in zip(np.atleast_1d(axes), link_examples):
-        rate_params = dict(N=384, sigma=link_sigma, T=1600.0, dt=0.05, burn=250, lam=1, f=link_fn)
-        rate_reps = 2
+        rate_params = dict(N=512, sigma=link_sigma, T=2200.0, dt=0.05, burn=350, lam=1, f=link_fn)
+        rate_reps = 3
         C_runs = []
+        c0_runs = []
         tau_s = None
         for _ in range(rate_reps):
             tau_run, C_run = mod.sim_rate_network(**rate_params)
             tau_s = tau_run
+            c0_runs.append(float(C_run[0]))
             C_runs.append(C_run / max(C_run[0], 1e-12))
         C_s = np.mean(C_runs, axis=0)
         C_s_std = np.std(C_runs, axis=0)
+        c0_mean = float(np.mean(c0_runs))
+        c0_lo = max(0.05, 0.6 * c0_mean)
+        c0_hi = max(c0_lo + 1e-6, 1.4 * c0_mean)
         tau_t, C_t = mod.theory_rate_autocorr(
             C0=None,
             sigma=link_sigma,
             tau_max=25,
             dtau=0.01,
             f=link_fn,
+            C0_bounds=(c0_lo, c0_hi),
         )
 
         ax.plot(tau_s, C_s, lw=1.8, label=f"Sim mean ({rate_reps} runs)")
@@ -220,7 +226,7 @@ def main():
             linewidth=0,
         )
         ax.plot(tau_t, C_t / max(C_t[0], 1e-12), "--", lw=2.0, label="Theory")
-        ax.set_title(f"{link_name}\n(sigma={link_sigma})")
+        ax.set_title(f"{link_name}\n(sigma={link_sigma}, N={rate_params['N']})")
         ax.set_xlabel("tau")
         ax.set_xlim(0, 20)
         ax.grid(alpha=0.15)
