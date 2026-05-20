@@ -9,7 +9,6 @@ Run each section independently. Requires numpy, scipy, matplotlib.
 import numpy as np
 from numpy.fft import fft, ifft, fftfreq
 import matplotlib.pyplot as plt
-from scipy.linalg import expm
 
 rng = np.random.default_rng(42)
 
@@ -97,7 +96,6 @@ def sim_rate_network(
 
 def theory_rate_autocorr(
     C0=None,
-    beta=1.0,
     sigma=1.5,
     tau_max=50,
     dtau=0.01,
@@ -106,8 +104,8 @@ def theory_rate_autocorr(
     C0_bounds=(0.05, 5.0),
 ):
     """
-     Solve the SCS equation:
-       C''(tau) = beta^2 [C(tau) - sigma^2 Q(tau)]
+         Solve the SCS equation:
+             C''(tau) = C(tau) - sigma^2 Q(tau)
        Q(tau) = <f(u(0))f(u(tau))>_Gaussian
     with u ~ N(0, C(0)).
 
@@ -190,10 +188,10 @@ def theory_rate_autocorr(
         integral_Q[1:] = np.cumsum(0.5 * (Q_grid[1:] + Q_grid[:-1]) * np.diff(C_grid))
         H_grid = np.maximum(C_grid**2 - 2.0 * integral_Q, 1e-14)
 
-        # Since C decays monotonically, integrate d tau / dC = 1 / (beta sqrt(H(C))).
+        # Since C decays monotonically, integrate d tau / dC = 1 / sqrt(H(C)).
         C_desc = C_grid[::-1]
         H_desc = H_grid[::-1]
-        speed = beta * np.sqrt(H_desc)
+        speed = np.sqrt(H_desc)
         dC = -np.diff(C_desc)
         seg_speed = 0.5 * (speed[:-1] + speed[1:])
         tau_desc = np.concatenate([[0.0], np.cumsum(dC / np.maximum(seg_speed, 1e-14))])
@@ -218,7 +216,7 @@ def plot_rate_network(sigma=1.5, N=512, C0_guess=0.8):
     C_sim /= C_sim[0]  # normalise
 
     print("Computing theory ...")
-    tau_th, C_th = theory_rate_autocorr(C0_guess, sigma)
+    tau_th, C_th = theory_rate_autocorr(C0=C0_guess, sigma=sigma)
 
     fig, axes = plt.subplots(1, 2, figsize=(12, 4))
 
@@ -226,9 +224,9 @@ def plot_rate_network(sigma=1.5, N=512, C0_guess=0.8):
     ax.plot(tau_sim, C_sim, "b", lw=1.5, label="Simulation")
     ax.plot(tau_th, C_th / C_th[0], "r--", lw=2, label="SCS theory")
     ax.set(
-        xlabel=r"$\\tau$",
-        ylabel=r"$C_{11}(\\tau)/C_{11}(0)$",
-        title=f"Rate network  $\\sigma={sigma}$",
+        xlabel=r"$\tau$",
+        ylabel=r"$C_{11}(\tau)/C_{11}(0)$",
+        title=f"Rate network  $\sigma={sigma}$",
         xlim=(0, 20),
     )
     ax.legend()
@@ -240,7 +238,7 @@ def plot_rate_network(sigma=1.5, N=512, C0_guess=0.8):
     Sw = np.abs(fft(np.concatenate([C_sim, C_sim[::-1]]))[:n])
     ax.semilogy(fq, Sw, "b", lw=1.5, label="Simulation")
     ax.set(
-        xlabel=r"$\\omega / 2\\pi$",
+        xlabel=r"$\omega / 2\pi$",
         ylabel="Power spectrum",
         title="Power spectrum",
         xlim=(0, 2),
@@ -335,16 +333,16 @@ def theory_binary_autocorr(sigma, beta, mu, f0, f1, tau_max=30, dtau=0.001):
     mu     : neuron off-rate
     f0, f1 : gain function coefficients
     """
-    # Steady state
+    # Steady state from the linear-gain binary model.
     gamma = mu + f0
     n_bar = f0 / gamma
-    c1 = f1 * mu / gamma  # effective gain f'(0)(1-n_bar)
-    D0 = 2 * n_bar * (1 - n_bar) * gamma  # intrinsic noise
-    g = c1 * sigma / gamma  # dimensionless coupling
+    c1 = f1 * mu / gamma
+    D0 = 2 * n_bar * (1 - n_bar) * gamma
+    g = c1 * sigma / gamma
 
     print(f"  gamma={gamma:.3f}, n_bar={n_bar:.3f}, c1={c1:.3f}, g={g:.3f}, D0={D0:.3f}")
     if g >= 1:
-        print(f"  WARNING: g={g:.3f} >= 1, network is above transition -> oscillatory.")
+        print(f"  WARNING: g={g:.3f} >= 1, above transition; stationary theory branch becomes oscillatory.")
 
     # Pole locations
     disc = (gamma**2 - beta**2) ** 2 + 4 * c1**2 * beta**2 * sigma**2
@@ -353,30 +351,69 @@ def theory_binary_autocorr(sigma, beta, mu, f0, f1, tau_max=30, dtau=0.001):
 
     tau = np.arange(0, tau_max, dtau)
 
-    if km2 >= 0:  # g < 1: two real exponentials
+    if km2 >= 0:  # g < 1: exact two-exponential branch
         kp, km = np.sqrt(kp2), np.sqrt(km2)
-        denom = kp * km * (km2 - kp2)  # note kp > km so this is negative
         Ap = D0 * 0.5 * (beta**2 - kp2) / (kp * (km2 - kp2))
-        Am = D0 * 0.5 * (beta**2 - km2) / (km * (kp2 - km2))
+        Am = D0 * 0.5 * (beta**2 - km2) / (km * (km2 - kp2))
         Cnn = Ap * np.exp(-kp * tau) + Am * np.exp(-km * tau)
-        # C_uu via convolution in frequency: multiply spectral weight beta^2*sigma^2/(beta^2+w^2)
-        # In time domain: C_uu = beta*sigma^2/2 * [Ap/kp * (e^{-kp|tau|} - e^{-beta|tau|})/(beta-kp)
-        #                                          + Am/km * similar] for beta != kp, km
-        def conv_exp(A, k):
-            if abs(beta - k) < 1e-8:
-                return A * beta * sigma**2 * tau * np.exp(-k * tau)
-            return A * beta**2 * sigma**2 / (beta**2 - k**2) * (
-                np.exp(-k * tau) - k / beta * np.exp(-beta * tau)
+
+        # Use the exact frequency-space relation:
+        #   C_uu(w) = [beta^2 sigma^2 / (beta^2 + w^2)] C_nn(w)
+        def uu_term(A, k):
+            denom = beta**2 - k**2
+            if abs(denom) < 1e-10 * max(1.0, beta**2):
+                # L'Hopital limit as k -> beta.
+                return A * beta * sigma**2 * tau * np.exp(-beta * tau)
+            return A * beta**2 * sigma**2 / denom * (
+                np.exp(-k * tau) - (k / beta) * np.exp(-beta * tau)
             )
 
-        Cuu = conv_exp(Ap, kp) + conv_exp(Am, km)
-    else:  # g > 1: oscillatory
+        Cuu = uu_term(Ap, kp) + uu_term(Am, km)
+    else:  # g > 1: complex-conjugate pole pair kp +/- i kr
         kp = np.sqrt(kp2)
-        kr = np.sqrt(-km2)  # imaginary part
-        Cnn = (D0 / kp) * np.exp(-kp * tau) * np.cos(kr * tau)
-        Cuu = np.zeros_like(Cnn)  # not derived here
+        kr = np.sqrt(-km2)
+        # Exact damped-oscillatory C_nn from the complex pole pair.
+        Cnn = np.exp(-kp * tau) * (
+            D0 / (2 * kp) * np.cos(kr * tau)
+            + D0 * (beta**2 - kp2) / (4 * kp * kr) * np.sin(kr * tau)
+        )
+
+        # Use the residue-based complex extension of the subcritical C_uu formula,
+        # then take the real part so C_uu remains real-valued.
+        k_cmplx = kp + 1j * kr
+        d_cmplx = beta**2 - k_cmplx**2
+        if abs(d_cmplx) > 1e-14:
+            term = (beta**2 * sigma**2 / d_cmplx) * (
+                np.exp(-k_cmplx * tau) - (k_cmplx / beta) * np.exp(-beta * tau)
+            )
+            Cuu = 2 * np.real(
+                D0 * 0.5 * (beta**2 - kp2 + 2j * kp * kr) / (4 * kp * kr) * term
+            )
+        else:
+            Cuu = np.zeros_like(tau)
 
     return tau, Cnn, Cuu, g
+
+
+def _binary_poles(sigma, beta, mu, f0, f1):
+    """Compute steady-state quantities and pole locations."""
+    gamma = mu + f0
+    n_bar = f0 / gamma
+    c1 = f1 * mu / gamma
+    D0 = 2 * n_bar * (1 - n_bar) * gamma
+    g = c1 * sigma / gamma
+    disc = (gamma**2 - beta**2) ** 2 + 4 * c1**2 * beta**2 * sigma**2
+    kp2 = 0.5 * ((gamma**2 + beta**2) + np.sqrt(disc))
+    km2 = 0.5 * ((gamma**2 + beta**2) - np.sqrt(disc))
+    return gamma, n_bar, c1, D0, g, kp2, km2
+
+
+def _binary_variance(sigma, beta, mu, f0, f1):
+    """Exact C_nn(0) for g < 1."""
+    gamma, _n_bar, c1, D0, g, _kp2, _km2 = _binary_poles(sigma, beta, mu, f0, f1)
+    if g >= 1:
+        return np.inf
+    return D0 / (gamma**2 * (1 - g**2))
 
 
 def plot_binary_network(sigma_vals=(0.5, 0.8, 0.95), N=800, beta=1.0, mu=1.0, f0=0.5, f1=1.0):
@@ -385,6 +422,8 @@ def plot_binary_network(sigma_vals=(0.5, 0.8, 0.95), N=800, beta=1.0, mu=1.0, f0
     Also shows the g=1 transition.
     """
     fig, axes = plt.subplots(2, len(sigma_vals), figsize=(5 * len(sigma_vals), 8))
+    if len(sigma_vals) == 1:
+        axes = np.array(axes).reshape(2, 1)
 
     for col, sigma in enumerate(sigma_vals):
         print(f"\n-- sigma={sigma} --")
@@ -406,9 +445,9 @@ def plot_binary_network(sigma_vals=(0.5, 0.8, 0.95), N=800, beta=1.0, mu=1.0, f0
         ax.plot(tau_s, Cnn_s, "b", lw=1.5, label="Sim")
         ax.plot(tau_th, Cnn_th_n, "r--", lw=2, label="Theory")
         ax.set(
-            xlabel=r"$\\tau$",
-            ylabel=r"$C_{nn}(\\tau)/C_{nn}(0)$",
-            title=fr"$\\sigma={sigma},\ g={g:.2f}$",
+            xlabel=r"$\tau$",
+            ylabel=r"$C_{nn}(\tau)/C_{nn}(0)$",
+            title=fr"$\sigma={sigma},\ g={g:.2f}$",
             xlim=(0, 20),
         )
         ax.legend(fontsize=8)
@@ -418,9 +457,9 @@ def plot_binary_network(sigma_vals=(0.5, 0.8, 0.95), N=800, beta=1.0, mu=1.0, f0
         ax.plot(tau_s, Cuu_s, "g", lw=1.5, label="Sim")
         ax.plot(tau_th, Cuu_th_n, "m--", lw=2, label="Theory")
         ax.set(
-            xlabel=r"$\\tau$",
-            ylabel=r"$C_{uu}(\\tau)/C_{uu}(0)$",
-            title=fr"$C_{{uu}}$,  $\\sigma={sigma}$",
+            xlabel=r"$\tau$",
+            ylabel=r"$C_{uu}(\tau)/C_{uu}(0)$",
+            title=fr"$C_{{uu}}$,  $\sigma={sigma}$",
             xlim=(0, 20),
         )
         ax.legend(fontsize=8)
@@ -456,10 +495,8 @@ def scan_transition(
     g_vals = []
 
     for sigma in sigma_vals:
-        tau_th, Cnn_th, _, g = theory_binary_autocorr(
-            sigma, beta, mu, f0, f1, tau_max=0.001
-        )
-        Cnn0_th.append(Cnn_th[0])
+        _gamma, _n_bar, _c1, _D0, g, _kp2, _km2 = _binary_poles(sigma, beta, mu, f0, f1)
+        Cnn0_th.append(_binary_variance(sigma, beta, mu, f0, f1))
         g_vals.append(g)
 
         tau_s, Cnn_s, _ = sim_binary_network(
@@ -467,7 +504,7 @@ def scan_transition(
         )
         Cnn0_sim.append(Cnn_s[0])
         print(
-            f"sigma={sigma:.3f}  g={g:.3f}  C_sim(0)={Cnn_s[0]:.4f}  C_th(0)={Cnn_th[0]:.4f}"
+            f"sigma={sigma:.3f}  g={g:.3f}  C_sim(0)={Cnn_s[0]:.4f}  C_th(0)={Cnn0_th[-1]:.4f}"
         )
 
     fig, axes = plt.subplots(1, 2, figsize=(11, 4))
@@ -506,18 +543,21 @@ def scan_transition(
 #    A+ exp(-kappa+ tau) + A- exp(-kappa- tau) and compare with theory.
 # -----------------------------------------------------------------------------
 
-def fit_two_exponentials(tau, C):
+def fit_two_exponentials(tau, C, p0_theory=None):
     """Least-squares fit of C(tau) = A+ e^{-k+ tau} + A- e^{-k- tau}."""
     from scipy.optimize import curve_fit
 
     def model(t, Ap, kp, Am, km):
         return Ap * np.exp(-kp * t) + Am * np.exp(-km * t)
 
-    C0 = C[0]
-    p0 = [C0 * 0.5, 2.0, C0 * 0.5, 0.3]
+    if p0_theory is not None:
+        p0 = list(p0_theory)
+    else:
+        C0 = C[0]
+        p0 = [C0 * 0.5, 2.0, C0 * 0.5, 0.3]
     bounds = ([0, 0, 0, 0], [np.inf, np.inf, np.inf, np.inf])
     try:
-        popt, _ = curve_fit(model, tau, C, p0=p0, bounds=bounds, maxfev=5000)
+        popt, _ = curve_fit(model, tau, C, p0=p0, bounds=bounds, maxfev=8000)
     except Exception:
         popt = p0
     return popt
@@ -532,15 +572,17 @@ def plot_two_timescale_fit(sigma=0.8, N=800, beta=1.0, mu=1.0, f0=0.5, f1=1.0):
     tau_s, Cnn_s, _ = sim_binary_network(
         N=N, sigma=sigma, beta=beta, mu=mu, f0=f0, f1=f1
     )
-    popt = fit_two_exponentials(tau_s[1:], Cnn_s[1:])
-    Ap, kp_fit, Am, km_fit = popt
-
-    # Theory kappa values
     gamma = mu + f0
     c1 = f1 * mu / gamma
     disc = (gamma**2 - beta**2) ** 2 + 4 * c1**2 * beta**2 * sigma**2
     kp_th = np.sqrt(0.5 * ((gamma**2 + beta**2) + np.sqrt(disc)))
     km_th = np.sqrt(0.5 * ((gamma**2 + beta**2) - np.sqrt(disc)))
+    D0 = 2 * (f0 / gamma) * (1 - f0 / gamma) * gamma
+    Ap_th = D0 * 0.5 * (beta**2 - kp_th**2) / (kp_th * (km_th**2 - kp_th**2))
+    Am_th = D0 * 0.5 * (beta**2 - km_th**2) / (km_th * (km_th**2 - kp_th**2))
+
+    popt = fit_two_exponentials(tau_s, Cnn_s, p0_theory=[Ap_th, kp_th, Am_th, km_th])
+    Ap, kp_fit, Am, km_fit = popt
 
     fit_curve = Ap * np.exp(-kp_fit * tau_s) + Am * np.exp(-km_fit * tau_s)
 
@@ -555,9 +597,9 @@ def plot_two_timescale_fit(sigma=0.8, N=800, beta=1.0, mu=1.0, f0=0.5, f1=1.0):
     )
     ax.axhline(0, color="k", lw=0.5)
     ax.set(
-        xlabel=r"$\\tau$",
-        ylabel=r"$C_{nn}(\\tau)$",
-        title=fr"Two-timescale structure: $\\sigma={sigma}$, $g={g:.2f}$",
+        xlabel=r"$\tau$",
+        ylabel=r"$C_{nn}(\tau)$",
+        title=fr"Two-timescale structure: $\sigma={sigma}$, $g={g:.2f}$",
         xlim=(0, 20),
     )
     ax.legend()
