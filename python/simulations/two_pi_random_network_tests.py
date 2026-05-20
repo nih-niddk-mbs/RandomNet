@@ -9,6 +9,7 @@ Run each section independently. Requires numpy, scipy, matplotlib.
 import numpy as np
 from numpy.fft import fft, ifft, fftfreq
 import matplotlib.pyplot as plt
+from scipy.special import ndtr
 
 rng = np.random.default_rng(42)
 
@@ -270,16 +271,18 @@ def sim_binary_network(
     dt=0.02,
     lam=1,
     burn=500,
+    clip_rate_on=True,
     rng=rng,
 ):
     """
     Gillespie-inspired Euler simulation of the binary network.
 
-    f(u) = f0 + f1*u (linear gain, clipped to be non-negative)
+    f(u) = f0 + f1*u (linear gain).
+    Set clip_rate_on=True to use max(f0 + f1*u, 0) for a biophysical variant.
     State: n_i in {0,1}, u_i continuous.
 
     At each step:
-      - Each neuron independently flips with probability rate*dt
+    - Each neuron independently flips with probability 1 - exp(-rate*dt)
       - u_i updated via Euler for the ODE
     """
     W = make_weights(N, sigma, lam, rng)
@@ -287,14 +290,25 @@ def sim_binary_network(
     u = np.zeros(N)
 
     def rate_on(u_):
-        return np.maximum(f0 + f1 * u_, 0.0)
+        rates = f0 + f1 * u_
+        if clip_rate_on:
+            return np.maximum(rates, 0.0)
+        if np.any(rates < 0):
+            min_rate = float(np.min(rates))
+            raise ValueError(
+                f"Unclipped linear-gain model produced negative on-rates (min={min_rate:.3e}). "
+                "Increase f0, decrease f1/sigma, or use clip_rate_on=True."
+            )
+        return rates
 
     nb = int(burn / dt)
     for _ in range(nb):
         r_on = rate_on(u) * (1 - n)
         r_off = mu * n
-        flip_on = rng.random(N) < r_on * dt
-        flip_off = rng.random(N) < r_off * dt
+        p_on = 1.0 - np.exp(-r_on * dt)
+        p_off = 1.0 - np.exp(-r_off * dt)
+        flip_on = rng.random(N) < p_on
+        flip_off = rng.random(N) < p_off
         n += flip_on.astype(float) - flip_off.astype(float)
         n = np.clip(n, 0, 1)
         u += dt * (-beta * u + beta * (W @ n))
@@ -305,8 +319,10 @@ def sim_binary_network(
     for t in range(nt):
         r_on = rate_on(u) * (1 - n)
         r_off = mu * n
-        flip_on = rng.random(N) < r_on * dt
-        flip_off = rng.random(N) < r_off * dt
+        p_on = 1.0 - np.exp(-r_on * dt)
+        p_off = 1.0 - np.exp(-r_off * dt)
+        flip_on = rng.random(N) < p_on
+        flip_off = rng.random(N) < p_off
         n += flip_on.astype(float) - flip_off.astype(float)
         n = np.clip(n, 0, 1)
         u += dt * (-beta * u + beta * (W @ n))
@@ -395,7 +411,160 @@ def theory_binary_autocorr(sigma, beta, mu, f0, f1, tau_max=30, dtau=0.001):
     return tau, Cnn, Cuu, g
 
 
-def plot_binary_network(sigma_vals=(0.5, 0.8, 0.95), N=800, beta=1.0, mu=1.0, f0=0.5, f1=1.0):
+def _Q_clipped(C11_tau, C11_0, f0, f1, sigma, n_quad=32):
+    """
+    Evaluate Q(tau) = E[[f0+f1*u(0)]_+ [f0+f1*u(tau)]_+] under a joint Gaussian.
+    """
+    gh_x, gh_w = np.polynomial.hermite.hermgauss(n_quad)
+    gh_w2 = np.outer(gh_w, gh_w)
+    if C11_0 <= 0:
+        return max(f0, 0.0) ** 2
+
+    s = sigma * np.sqrt(C11_0)
+    rho = float(np.clip(C11_tau / C11_0, -0.999999, 0.999999))
+    xi = gh_x[:, None] * np.sqrt(2.0)
+    yi = gh_x[None, :] * np.sqrt(2.0)
+    u0 = s * xi
+    utau = s * (rho * xi + np.sqrt(1.0 - rho**2) * yi)
+    r0 = np.maximum(f0 + f1 * u0, 0.0)
+    rt = np.maximum(f0 + f1 * utau, 0.0)
+    return float(np.sum(gh_w2 * r0 * rt) / np.pi)
+
+
+def theory_binary_clipped(
+    sigma,
+    beta,
+    mu,
+    f0,
+    f1,
+    tau_max=30,
+    dtau=0.05,
+    n_quad=32,
+    max_iter=60,
+    tol=1e-5,
+    mix=0.4,
+):
+    """
+    Self-consistent 2PI theory for clipped gain f(u)=max(f0+f1*u,0).
+
+    Solves C11_hat(w) = beta^2 * Q_hat(w) / (beta^2 + w^2) with Q nonlinear in C11.
+    """
+    gamma = mu + f0
+    ntau = int(tau_max / dtau)
+    tau = np.arange(ntau) * dtau
+    omega = fftfreq(ntau, d=dtau) * 2.0 * np.pi
+    filt = beta**2 / (beta**2 + omega**2)
+
+    # Use linear theory as initial condition.
+    _, C11_lin, _, g_lin = theory_binary_autocorr(
+        sigma, beta, mu, f0, f1, tau_max=tau_max, dtau=dtau
+    )
+    C11 = np.maximum(C11_lin.copy(), 0.0)
+
+    print(f"  [clipped] sigma={sigma:.3f}, g_linear={g_lin:.3f}, iterating...")
+
+    for it in range(max_iter):
+        C11_0 = float(max(C11[0], 1e-12))
+        Q = np.array([
+            _Q_clipped(C11[k], C11_0, f0, f1, sigma, n_quad=n_quad)
+            for k in range(ntau)
+        ])
+        C11_new = np.real(ifft(filt * fft(Q)))
+        C11_new = np.maximum(C11_new, 0.0)
+        change = float(np.max(np.abs(C11_new - C11)))
+        C11 = (1.0 - mix) * C11 + mix * C11_new
+        if change < tol:
+            print(f"    converged at iteration {it + 1}, change={change:.2e}")
+            break
+    else:
+        print(f"    did not converge after {max_iter} iterations, last change={change:.2e}")
+
+    C11_0 = float(max(C11[0], 1e-12))
+    c1_eff = f1 * float(ndtr(f0 / (sigma * np.sqrt(C11_0))))
+    g_eff = c1_eff * sigma / gamma
+    print(f"    C11(0)={C11_0:.4f}, c1_eff={c1_eff:.4f}, g_eff={g_eff:.4f}")
+    return tau, C11, g_eff
+
+
+def plot_clipped_vs_linear(
+    sigma_vals=(0.7, 1.0, 1.3), N=800, beta=1.0, mu=1.0, f0=0.5, f1=1.0
+):
+    """Compare clipped simulation with clipped-vs-linear theory predictions."""
+    fig, axes = plt.subplots(1, len(sigma_vals), figsize=(5 * len(sigma_vals), 4))
+    if len(sigma_vals) == 1:
+        axes = [axes]
+
+    for ax, sigma in zip(axes, sigma_vals):
+        print(f"\n-- clipped compare sigma={sigma} --")
+
+        gamma = mu + f0
+        c1 = f1 * mu / gamma
+        g_lin = c1 * sigma / gamma
+
+        if g_lin < 1.0:
+            tau_lin, Cnn_lin, _, _ = theory_binary_autocorr(
+                sigma, beta, mu, f0, f1, tau_max=20, dtau=0.05
+            )
+        else:
+            tau_lin, Cnn_lin = None, None
+
+        tau_clip, C11_clip, g_eff = theory_binary_clipped(
+            sigma, beta, mu, f0, f1, tau_max=20, dtau=0.05
+        )
+
+        tau_s, Cnn_s, _ = sim_binary_network(
+            N=N,
+            sigma=sigma,
+            beta=beta,
+            mu=mu,
+            f0=f0,
+            f1=f1,
+            clip_rate_on=True,
+        )
+
+        def norm(x):
+            x0 = float(x[0])
+            return x / x0 if abs(x0) > 1e-12 else x
+
+        ax.plot(tau_s, norm(Cnn_s), "b", lw=1.5, alpha=0.8, label="Sim (clipped)")
+        ax.plot(
+            tau_clip,
+            norm(C11_clip),
+            "r--",
+            lw=2,
+            label=fr"2PI clipped ($g_{{eff}}={g_eff:.2f}$)",
+        )
+        if Cnn_lin is not None:
+            ax.plot(
+                tau_lin,
+                norm(Cnn_lin),
+                "g:",
+                lw=1.5,
+                label=fr"Linear ($g={g_lin:.2f}$)",
+            )
+        ax.set(
+            xlabel=r"$\tau$",
+            ylabel=r"$C_{nn}(\tau)/C_{nn}(0)$",
+            title=fr"$\sigma={sigma}$",
+            xlim=(0, 15),
+        )
+        ax.legend(fontsize=8)
+
+    plt.suptitle("Clipped vs linear gain: binary 2PI", fontsize=13, fontweight="bold")
+    plt.tight_layout()
+    plt.savefig("clipped_vs_linear.png", dpi=150)
+    plt.show()
+
+
+def plot_binary_network(
+    sigma_vals=(0.5, 0.8, 0.95),
+    N=800,
+    beta=1.0,
+    mu=1.0,
+    f0=0.5,
+    f1=1.0,
+    clip_rate_on=True,
+):
     """
     For each sigma, compare simulation vs theory.
     Also shows the g=1 transition.
@@ -410,7 +579,13 @@ def plot_binary_network(sigma_vals=(0.5, 0.8, 0.95), N=800, beta=1.0, mu=1.0, f0
 
         print("  Simulating ...")
         tau_s, Cnn_s, Cuu_s = sim_binary_network(
-            N=N, sigma=sigma, beta=beta, mu=mu, f0=f0, f1=f1
+            N=N,
+            sigma=sigma,
+            beta=beta,
+            mu=mu,
+            f0=f0,
+            f1=f1,
+            clip_rate_on=clip_rate_on,
         )
 
         # normalise by C(0)
@@ -475,14 +650,22 @@ def fit_two_exponentials(tau, C, p0_theory=None):
     return popt
 
 
-def plot_two_timescale_fit(sigma=0.8, N=800, beta=1.0, mu=1.0, f0=0.5, f1=1.0):
+def plot_two_timescale_fit(
+    sigma=0.8, N=800, beta=1.0, mu=1.0, f0=0.5, f1=1.0, clip_rate_on=True
+):
     """
     Show that the simulated correlation function is well fit by two exponentials,
     with decay rates matching theory predictions kappa+ and kappa-.
     """
     tau_th, Cnn_th, _, g = theory_binary_autocorr(sigma, beta, mu, f0, f1)
     tau_s, Cnn_s, _ = sim_binary_network(
-        N=N, sigma=sigma, beta=beta, mu=mu, f0=f0, f1=f1
+        N=N,
+        sigma=sigma,
+        beta=beta,
+        mu=mu,
+        f0=f0,
+        f1=f1,
+        clip_rate_on=clip_rate_on,
     )
     gamma = mu + f0
     c1 = f1 * mu / gamma
@@ -533,6 +716,69 @@ def plot_two_timescale_fit(sigma=0.8, N=800, beta=1.0, mu=1.0, f0=0.5, f1=1.0):
 
 
 # -----------------------------------------------------------------------------
+# 4. CONVERGENCE WITH NETWORK SIZE
+#    Plot correlation functions for binary network at different N values
+#    against theory to visualize finite-size effects
+# -----------------------------------------------------------------------------
+
+def plot_binary_network_N_convergence(sigma=0.8, N_vals=(128, 300, 800, 1600),
+                                       beta=1.0, mu=1.0, f0=0.5, f1=1.0,
+                                       clip_rate_on=True):
+    """
+    Compare simulation vs theory for binary network at multiple network sizes.
+    Shows how finite-size effects diminish as N increases.
+    """
+    print(f"\n-- Binary network: N convergence at sigma={sigma} --")
+    tau_th, Cnn_th, Cuu_th, g = theory_binary_autocorr(sigma, beta, mu, f0, f1)
+    Cnn_th_n = Cnn_th / max(Cnn_th[0], 1e-10)
+    Cuu_th_n = Cuu_th / max(Cuu_th[0], 1e-10) if Cuu_th[0] > 0 else Cuu_th
+
+    colors = plt.cm.viridis(np.linspace(0, 1, len(N_vals)))
+
+    fig, axes = plt.subplots(1, 2, figsize=(12, 5))
+
+    # C_nn convergence
+    ax = axes[0]
+    ax.plot(tau_th, Cnn_th_n, "k--", lw=3, label="Theory", alpha=0.8, zorder=100)
+    sim_curves = {}
+    for N, color in zip(N_vals, colors):
+        print(f"  Simulating N={N} ...")
+        tau_s, Cnn_s, Cuu_s = sim_binary_network(
+            N=N,
+            sigma=sigma,
+            beta=beta,
+            mu=mu,
+            f0=f0,
+            f1=f1,
+            clip_rate_on=clip_rate_on,
+        )
+        sim_curves[N] = (tau_s, Cnn_s, Cuu_s)
+        Cnn_s_n = Cnn_s / max(Cnn_s[0], 1e-10)
+        ax.plot(tau_s, Cnn_s_n, lw=1.5, color=color, label=f"N={N}")
+    ax.set(xlabel=r"$\tau$", ylabel=r"$C_{nn}(\tau)/C_{nn}(0)$",
+           title=fr"$C_{{nn}}$ convergence: $\sigma={sigma}$, $g={g:.2f}$",
+           xlim=(0, 20))
+    ax.legend(fontsize=9)
+
+    # C_uu convergence
+    ax = axes[1]
+    ax.plot(tau_th, Cuu_th_n, "k--", lw=3, label="Theory", alpha=0.8, zorder=100)
+    for N, color in zip(N_vals, colors):
+        tau_s, _, Cuu_s = sim_curves[N]
+        Cuu_s_n = Cuu_s / max(abs(Cuu_s[0]), 1e-10)
+        ax.plot(tau_s, Cuu_s_n, lw=1.5, color=color, label=f"N={N}")
+    ax.set(xlabel=r"$\tau$", ylabel=r"$C_{uu}(\tau)/C_{uu}(0)$",
+           title=fr"$C_{{uu}}$ convergence: $\sigma={sigma}$",
+           xlim=(0, 20))
+    ax.legend(fontsize=9)
+
+    plt.suptitle(f"Binary network: finite-size convergence", fontsize=13, fontweight="bold")
+    plt.tight_layout()
+    plt.savefig("binary_network_N_convergence.png", dpi=150)
+    plt.show()
+
+
+# -----------------------------------------------------------------------------
 # Main
 # -----------------------------------------------------------------------------
 
@@ -547,3 +793,9 @@ if __name__ == "__main__":
 
     # 3. Two-timescale exponential fit
     plot_two_timescale_fit(sigma=0.8, N=800)
+
+    # 4. Finite-size convergence
+    plot_binary_network_N_convergence(sigma=0.8, N_vals=(128, 300, 800, 1600))
+
+    # 5. Clipped-gain theory vs simulation
+    plot_clipped_vs_linear(sigma_vals=(0.7, 1.0, 1.3), N=800)
