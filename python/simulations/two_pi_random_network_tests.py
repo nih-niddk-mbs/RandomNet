@@ -395,27 +395,6 @@ def theory_binary_autocorr(sigma, beta, mu, f0, f1, tau_max=30, dtau=0.001):
     return tau, Cnn, Cuu, g
 
 
-def _binary_poles(sigma, beta, mu, f0, f1):
-    """Compute steady-state quantities and pole locations."""
-    gamma = mu + f0
-    n_bar = f0 / gamma
-    c1 = f1 * mu / gamma
-    D0 = 2 * n_bar * (1 - n_bar) * gamma
-    g = c1 * sigma / gamma
-    disc = (gamma**2 - beta**2) ** 2 + 4 * c1**2 * beta**2 * sigma**2
-    kp2 = 0.5 * ((gamma**2 + beta**2) + np.sqrt(disc))
-    km2 = 0.5 * ((gamma**2 + beta**2) - np.sqrt(disc))
-    return gamma, n_bar, c1, D0, g, kp2, km2
-
-
-def _binary_variance(sigma, beta, mu, f0, f1):
-    """Exact C_nn(0) for g < 1."""
-    gamma, _n_bar, c1, D0, g, _kp2, _km2 = _binary_poles(sigma, beta, mu, f0, f1)
-    if g >= 1:
-        return np.inf
-    return D0 / (gamma**2 * (1 - g**2))
-
-
 def plot_binary_network(sigma_vals=(0.5, 0.8, 0.95), N=800, beta=1.0, mu=1.0, f0=0.5, f1=1.0):
     """
     For each sigma, compare simulation vs theory.
@@ -471,74 +450,7 @@ def plot_binary_network(sigma_vals=(0.5, 0.8, 0.95), N=800, beta=1.0, mu=1.0, f0
 
 
 # -----------------------------------------------------------------------------
-# 3. TRANSITION SCAN
-#    Sweep sigma and measure C_nn(0) (variance) vs theory prediction.
-#    Should diverge as g -> 1.
-# -----------------------------------------------------------------------------
-
-def scan_transition(
-    N=600, beta=1.0, mu=1.0, f0=0.5, f1=1.0, sigma_vals=None, T=3000, dt=0.02
-):
-    """
-    Measure C_nn(0) from simulation and theory across a range of sigma.
-    The variance should diverge as g = c1*sigma/gamma -> 1.
-    """
-    if sigma_vals is None:
-        # sigma_crit = gamma/c1 = (mu+f0)^2 / (f1*mu)
-        gamma = mu + f0
-        c1 = f1 * mu / gamma
-        s_crit = gamma / c1
-        sigma_vals = np.linspace(0.1, 0.93 * s_crit, 14)
-
-    Cnn0_sim = []
-    Cnn0_th = []
-    g_vals = []
-
-    for sigma in sigma_vals:
-        _gamma, _n_bar, _c1, _D0, g, _kp2, _km2 = _binary_poles(sigma, beta, mu, f0, f1)
-        Cnn0_th.append(_binary_variance(sigma, beta, mu, f0, f1))
-        g_vals.append(g)
-
-        tau_s, Cnn_s, _ = sim_binary_network(
-            N=N, sigma=sigma, beta=beta, mu=mu, f0=f0, f1=f1, T=T, dt=dt
-        )
-        Cnn0_sim.append(Cnn_s[0])
-        print(
-            f"sigma={sigma:.3f}  g={g:.3f}  C_sim(0)={Cnn_s[0]:.4f}  C_th(0)={Cnn0_th[-1]:.4f}"
-        )
-
-    fig, axes = plt.subplots(1, 2, figsize=(11, 4))
-
-    ax = axes[0]
-    ax.plot(g_vals, Cnn0_sim, "bo-", ms=5, label="Simulation")
-    ax.plot(g_vals, Cnn0_th, "r--", lw=2, label="Theory")
-    ax.axvline(1, color="k", ls=":", lw=1.5, label="$g=1$ (transition)")
-    ax.set(
-        xlabel="$g = c_1\\sigma/\\gamma$",
-        ylabel="$C_{nn}(0)$",
-        title="Variance vs coupling strength",
-    )
-    ax.legend()
-
-    ax = axes[1]
-    ax.semilogy(g_vals, Cnn0_sim, "bo-", ms=5, label="Simulation")
-    ax.semilogy(g_vals, Cnn0_th, "r--", lw=2, label="Theory")
-    ax.axvline(1, color="k", ls=":", lw=1.5)
-    ax.set(
-        xlabel="$g$",
-        ylabel="$C_{nn}(0)$  [log scale]",
-        title="Variance divergence at transition",
-    )
-    ax.legend()
-
-    plt.suptitle("Binary network: variance scan across transition", fontsize=13, fontweight="bold")
-    plt.tight_layout()
-    plt.savefig("binary_transition_scan.png", dpi=150)
-    plt.show()
-
-
-# -----------------------------------------------------------------------------
-# 4. TWO-TIMESCALE FIT
+# 3. TWO-TIMESCALE FIT
 #    Fit the simulated C_nn(tau) to the two-exponential form
 #    A+ exp(-kappa+ tau) + A- exp(-kappa- tau) and compare with theory.
 # -----------------------------------------------------------------------------
@@ -593,7 +505,7 @@ def plot_two_timescale_fit(sigma=0.8, N=800, beta=1.0, mu=1.0, f0=0.5, f1=1.0):
         fit_curve,
         "r--",
         lw=2,
-        label=fr"Fit: $\\kappa_+={kp_fit:.3f}$, $\\kappa_-={km_fit:.3f}$",
+        label=fr"Fit: $\kappa_+={kp_fit:.3f}$, $\kappa_-={km_fit:.3f}$",
     )
     ax.axhline(0, color="k", lw=0.5)
     ax.set(
@@ -633,8 +545,5 @@ if __name__ == "__main__":
     # 2. Binary network: shape of correlation functions
     plot_binary_network(sigma_vals=(0.5, 0.8, 0.95), N=800)
 
-    # 3. Variance divergence at transition
-    scan_transition(N=600)
-
-    # 4. Two-timescale exponential fit
+    # 3. Two-timescale exponential fit
     plot_two_timescale_fit(sigma=0.8, N=800)
