@@ -224,8 +224,10 @@ def theory_rate_autocorr(
     return tau, C
 
 
-def plot_rate_network(sigma=1.5, N=512, C0_guess=0.8):
+def plot_rate_network(sigma=1.5, N=512, C0_guess=0.8, plot_dir="plots"):
     """Compare simulation vs theory for rate network."""
+    import os
+    os.makedirs(plot_dir, exist_ok=True)
     print(f"Simulating rate network: N={N}, sigma={sigma} ...")
     tau_sim, C_sim = sim_rate_network(N=N, sigma=sigma)
     C_sim /= C_sim[0]  # normalise
@@ -262,7 +264,8 @@ def plot_rate_network(sigma=1.5, N=512, C0_guess=0.8):
 
     plt.suptitle("Rate network: SCS test", fontsize=13, fontweight="bold")
     plt.tight_layout()
-    plt.savefig("rate_network_test.png", dpi=150)
+    plt.savefig(os.path.join(plot_dir, "rate_network_test.png"), dpi=150)
+    print(f"Saved to {os.path.join(plot_dir, 'rate_network_test.png')}")
     plt.show()
 
 
@@ -307,7 +310,7 @@ def sim_phase_network(
         phi[spikes] -= 2.0 * np.pi
         with np.errstate(over="ignore", divide="ignore", invalid="ignore"):
             drive = W @ spikes.astype(float)
-        u += dt * (-beta * u + beta * drive)
+        u += -beta * u * dt + beta * drive
         if not np.all(np.isfinite(u)):
             u = np.nan_to_num(u, nan=0.0, posinf=1e6, neginf=-1e6)
 
@@ -324,7 +327,7 @@ def sim_phase_network(
         phi[spikes] -= 2.0 * np.pi
         with np.errstate(over="ignore", divide="ignore", invalid="ignore"):
             drive = W @ spikes.astype(float)
-        u += dt * (-beta * u + beta * drive)
+        u += -beta * u * dt + beta * drive
         if not np.all(np.isfinite(u)):
             u = np.nan_to_num(u, nan=0.0, posinf=1e6, neginf=-1e6)
         U_probe[t] = u[probe_idx]
@@ -469,6 +472,7 @@ def plot_phase_spike_correlation(
     dt=0.02,
     dtau=0.02,
     tau_max=120.0,
+    plot_dir="plots",
 ):
     """Compare phase-model spike autocorrelation from simulation and theory."""
     _, _, sigma_c = theory_phase_autocorr(
@@ -521,7 +525,10 @@ def plot_phase_spike_correlation(
     ax.set_xlim(0, 120)
     ax.legend()
     fig.tight_layout()
-    plt.savefig("phase_spike_correlation_test.png", dpi=150)
+    import os
+    os.makedirs(plot_dir, exist_ok=True)
+    plt.savefig(os.path.join(plot_dir, "phase_spike_correlation_test.png"), dpi=150)
+    print(f"Saved to {os.path.join(plot_dir, 'phase_spike_correlation_test.png')}")
     plt.show()
 
 
@@ -536,6 +543,7 @@ def plot_phase_network(
     dtau=0.02,
     tau_max=120.0,
     sim_reps=3,
+    plot_dir="plots",
 ):
     """Compare phase-network simulation and reduced-theory autocorrelations."""
     rho = 1.0 / (2.0 * np.pi)
@@ -606,8 +614,11 @@ def plot_phase_network(
         fontsize=13,
         fontweight="bold",
     )
+    import os
+    os.makedirs(plot_dir, exist_ok=True)
     plt.tight_layout()
-    plt.savefig("phase_network_test.png", dpi=150)
+    plt.savefig(os.path.join(plot_dir, "phase_network_test.png"), dpi=150)
+    print(f"Saved to {os.path.join(plot_dir, 'phase_network_test.png')}")
     plt.show()
 
 
@@ -1073,6 +1084,7 @@ def plot_clipped_vs_linear(
     sim_method="tau-leap",
     sim_cache_path=None,
     force_resim=False,
+    plot_dir="plots",
 ):
     """Compare clipped simulation with clipped-vs-linear theory predictions."""
     cached = {}
@@ -1161,8 +1173,11 @@ def plot_clipped_vs_linear(
         ax.legend(fontsize=8)
 
     plt.suptitle("Clipped vs linear gain: binary 2PI", fontsize=13, fontweight="bold")
+    import os
+    os.makedirs(plot_dir, exist_ok=True)
     plt.tight_layout()
-    plt.savefig("clipped_vs_linear.png", dpi=150)
+    plt.savefig(os.path.join(plot_dir, "clipped_vs_linear.png"), dpi=150)
+    print(f"Saved to {os.path.join(plot_dir, 'clipped_vs_linear.png')}")
     plt.show()
 
     if sim_cache_path is not None and (cache_updated or force_resim):
@@ -1185,6 +1200,7 @@ def plot_binary_network(
     f1=1.0,
     clip_rate_on=True,
     sim_method="tau-leap",
+    plot_dir="plots",
 ):
     """
     For each sigma, compare simulation vs theory.
@@ -1241,8 +1257,11 @@ def plot_binary_network(
         ax.legend(fontsize=8)
 
     plt.suptitle("Binary neuron network: 2PI theory test", fontsize=13, fontweight="bold")
+    import os
+    os.makedirs(plot_dir, exist_ok=True)
     plt.tight_layout()
-    plt.savefig("binary_network_test.png", dpi=150)
+    plt.savefig(os.path.join(plot_dir, "binary_network_test.png"), dpi=150)
+    print(f"Saved to {os.path.join(plot_dir, 'binary_network_test.png')}")
     plt.show()
 
 
@@ -1281,6 +1300,7 @@ def plot_two_timescale_fit(
     f1=1.0,
     clip_rate_on=True,
     sim_method="tau-leap",
+    plot_dir="plots",
 ):
     """
     Show that the simulated correlation function is well fit by two exponentials,
@@ -1341,7 +1361,10 @@ def plot_two_timescale_fit(
         fontsize=9,
     )
     plt.tight_layout()
-    plt.savefig("two_timescale_fit.png", dpi=150)
+    import os
+    os.makedirs(plot_dir, exist_ok=True)
+    plt.savefig(os.path.join(plot_dir, "two_timescale_fit.png"), dpi=150)
+    print(f"Saved to {os.path.join(plot_dir, 'two_timescale_fit.png')}")
     plt.show()
 
 
@@ -1353,7 +1376,8 @@ def plot_two_timescale_fit(
 
 def plot_binary_network_N_convergence(sigma=0.8, N_vals=(128, 300, 800, 1600),
                                        beta=1.0, mu=1.0, f0=0.5, f1=1.0,
-                                       clip_rate_on=True, sim_method="tau-leap"):
+                                       clip_rate_on=True, sim_method="tau-leap",
+                                       plot_dir="plots"):
     """
     Compare simulation vs theory for binary network at multiple network sizes.
     Shows how finite-size effects diminish as N increases.
@@ -1404,8 +1428,11 @@ def plot_binary_network_N_convergence(sigma=0.8, N_vals=(128, 300, 800, 1600),
     ax.legend(fontsize=9)
 
     plt.suptitle(f"Binary network: finite-size convergence", fontsize=13, fontweight="bold")
+    import os
+    os.makedirs(plot_dir, exist_ok=True)
     plt.tight_layout()
-    plt.savefig("binary_network_N_convergence.png", dpi=150)
+    plt.savefig(os.path.join(plot_dir, "binary_network_N_convergence.png"), dpi=150)
+    print(f"Saved to {os.path.join(plot_dir, 'binary_network_N_convergence.png')}")
     plt.show()
 
 
@@ -1414,19 +1441,22 @@ def plot_binary_network_N_convergence(sigma=0.8, N_vals=(128, 300, 800, 1600),
 # -----------------------------------------------------------------------------
 
 if __name__ == "__main__":
+    import os
+    plot_dir = "plots"
+    os.makedirs(plot_dir, exist_ok=True)
 
     # 1. Rate network
     # sigma < 1 -> fixed point, sigma > 1 -> chaos for tanh
-    plot_rate_network(sigma=1.5, N=512, C0_guess=0.65)
+    plot_rate_network(sigma=1.5, N=512, C0_guess=0.65, plot_dir=plot_dir)
 
     # 2. Binary network: shape of correlation functions
-    plot_binary_network(sigma_vals=(0.5, 0.8, 0.95), N=800)
+    plot_binary_network(sigma_vals=(0.5, 0.8, 0.95), N=800, plot_dir=plot_dir)
 
     # 3. Two-timescale exponential fit
-    plot_two_timescale_fit(sigma=0.8, N=800)
+    plot_two_timescale_fit(sigma=0.8, N=800, plot_dir=plot_dir)
 
     # 4. Finite-size convergence
-    plot_binary_network_N_convergence(sigma=0.8, N_vals=(128, 300, 800, 1600))
+    plot_binary_network_N_convergence(sigma=0.8, N_vals=(128, 300, 800, 1600), plot_dir=plot_dir)
 
     # 5. Clipped-gain theory vs simulation
-    plot_clipped_vs_linear(sigma_vals=(0.7, 1.0, 1.3), N=800)
+    plot_clipped_vs_linear(sigma_vals=(0.7, 1.0, 1.3), N=800, plot_dir=plot_dir)
