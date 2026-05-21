@@ -103,6 +103,7 @@ def theory_rate_autocorr(
     f=np.tanh,
     n_quad=20,
     C0_bounds=(0.05, 5.0),
+    mu_f=None,
 ):
     """
          Solve the SCS equation:
@@ -117,6 +118,10 @@ def theory_rate_autocorr(
     The physical solution is the monotone branch that satisfies the energy
     condition V(C(0)) = V(0) = 0, where V'(C) = -C + sigma^2 Q(C).
     If C0 is None, we solve for that self-consistent C0 by bisection.
+    
+    If mu_f is provided (a scalar or callable), Q is computed as centered covariance:
+        Q_centered(tau) = E[f(x)f(y)] - mu_f(C0)^2
+    This is needed for activation functions with nonzero mean (e.g., ReLU-like gains).
     """
     ntau = int(tau_max / dtau)
     tau = np.arange(ntau) * dtau
@@ -124,7 +129,8 @@ def theory_rate_autocorr(
     gh_w2 = np.outer(gh_w, gh_w)
 
     def Q_func(C_tau, C0_val):
-        """Deterministic quadrature for E[f(x)f(y)] with correlated Gaussian x,y."""
+        """Deterministic quadrature for E[f(x)f(y)] with correlated Gaussian x,y,
+        optionally centered by subtracting mu_f^2."""
         if C0_val <= 0:
             return 0.0
         rho = float(np.clip(C_tau / C0_val, -0.999999, 0.999999))
@@ -132,7 +138,14 @@ def theory_rate_autocorr(
         x = scale * gh_x[:, None]
         y = scale * (rho * gh_x[:, None] + np.sqrt(1.0 - rho**2) * gh_x[None, :])
         vals = f(x) * f(y)
-        return float(np.sum(gh_w2 * vals) / np.pi)
+        Q_raw = float(np.sum(gh_w2 * vals) / np.pi)
+        
+        # Subtract mu^2 if centering is requested (for nonzero-mean activation functions)
+        if mu_f is not None:
+            mu = mu_f(C0_val) if callable(mu_f) else float(mu_f)
+            Q_centered = Q_raw - mu**2
+            return Q_centered
+        return Q_raw
 
     def energy_endpoint(C0_val, n_grid=256):
         """Return H(C0) = C0^2 - 2∫_0^{C0} Q(C; C0) dC."""
@@ -342,6 +355,9 @@ def theory_phase_autocorr(
 
     For this model, the closure has the same scalar structure as the rate case,
     with effective gain g(u) = rho * F(u), rho = 1/(2*pi).
+    
+    Since g(u) = rho * max(I+u, 0) has nonzero mean for I > 0, we compute the
+    centered covariance Q_centered = E[g(u0)g(uτ)] - E[g]^2 in the SCS closure.
     """
     rho = 1.0 / (2.0 * np.pi)
 
@@ -351,7 +367,7 @@ def theory_phase_autocorr(
     Fprime0 = float(np.maximum(I, 1e-10) ** (1.0 / alpha - 1.0))
     sigma_c = 1.0 / (rho * Fprime0)
 
-    # Gauss-Hermite nodes for centering g.
+    # Gauss-Hermite nodes for computing E[g] self-consistently
     gh_x, gh_w = np.polynomial.hermite.hermgauss(n_quad)
 
     def mu_g(C0_val):
@@ -361,35 +377,21 @@ def theory_phase_autocorr(
         s = np.sqrt(2.0 * float(C0_val))
         return float(np.sum(gh_w * g(s * gh_x)) / np.sqrt(np.pi))
 
-    # With row-sum corrected W, only the centered gain enters the SCS closure.
-    # Pass g_c = g - E[g] to theory_rate_autocorr.  Because the mean depends on
-    # C0, we do one warm-up pass with raw g to get an approximate C0, then
-    # center and solve properly.
     tau_scale = max(float(beta), 1e-10)
+    
+    # For phase model with I > 0, variance can be large. Use wider bounds.
+    C0_bounds_phase = (0.1, 500.0)
 
-    # Pass 1: rough C0 with raw g (gives wrong amplitude but usable C0 estimate)
-    _, C_warm = theory_rate_autocorr(
+    # Solve SCS with centered Q: Q -> Q - mu_g^2
+    tau_s, C_s = theory_rate_autocorr(
         C0=C0,
         sigma=sigma,
         tau_max=tau_max * tau_scale,
         dtau=dtau * tau_scale,
         f=g,
         n_quad=n_quad,
-    )
-    C0_est = float(C_warm[0])
-    mean_g = mu_g(C0_est)
-
-    def g_centered(u):
-        return g(u) - mean_g
-
-    # Pass 2: solve with centered gain
-    tau_s, C_s = theory_rate_autocorr(
-        C0=None,
-        sigma=sigma,
-        tau_max=tau_max * tau_scale,
-        dtau=dtau * tau_scale,
-        f=g_centered,
-        n_quad=n_quad,
+        C0_bounds=C0_bounds_phase,
+        mu_f=mu_g,  # Pass mean function for centering
     )
     return tau_s / tau_scale, C_s, sigma_c
 
