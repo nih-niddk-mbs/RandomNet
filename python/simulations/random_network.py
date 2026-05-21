@@ -1,9 +1,8 @@
 """
-Simulations to test the 2PI effective action theory for two random neural networks:
-    1. Rate neuron network          -- tests the Sompolinsky-Crisanti-Sommers equation
-  2. Binary neuron network        -- tests the exact two-exponential formula
-
-Note: The first model is a rate network, not a phase-neuron model.
+Simulations to test the 2PI effective action theory for random neural networks:
+        1. Rate neuron network          -- Sompolinsky-Crisanti-Sommers equation
+        2. Phase neuron network         -- phase-reset spiking with synaptic drive u
+        3. Binary neuron network        -- exact two-exponential formula
 
 Run each section independently. Requires numpy, scipy, matplotlib.
 """
@@ -254,6 +253,332 @@ def plot_rate_network(sigma=1.5, N=512, C0_guess=0.8):
 
 
 # -----------------------------------------------------------------------------
+# 1b. PHASE NEURON NETWORK
+#     phi_i in [-pi, pi], dphi_i/dt = alpha * max(I + u_i, 0)^(1/alpha)
+#     spikes when phi_i crosses pi; u_i is driven by spike input through W.
+# -----------------------------------------------------------------------------
+
+def sim_phase_network(
+    N=512,
+    I=1.0,
+    alpha=1.0,
+    sigma=7.0,
+    beta=1.0,
+    T=3000.0,
+    dt=0.02,
+    lam=1,
+    burn=300,
+    tau_max=50.0,
+    n_probe=None,
+    return_spike=False,
+    rng=rng,
+):
+    """Simulate a phase-reset network and return C_uu(tau).
+
+    If return_spike is True, also return C_spk(tau) estimated from the
+    whole-network population spike-rate time series r(t)=N_spk(t)/(N*dt).
+    This is much smoother than averaging per-neuron sparse spike trains.
+    """
+    W = make_weights(N, sigma, lam, rng)
+    phi = rng.uniform(-np.pi, np.pi, N)
+    u = np.zeros(N)
+
+    def F(u_):
+        return alpha * np.maximum(I + u_, 0.0) ** (1.0 / alpha)
+
+    nb = int(burn / dt)
+    for _ in range(nb):
+        phi += F(u) * dt
+        spikes = phi >= np.pi
+        phi[spikes] -= 2.0 * np.pi
+        with np.errstate(over="ignore", divide="ignore", invalid="ignore"):
+            drive = W @ spikes.astype(float)
+        u += dt * (-beta * u + beta * drive)
+        if not np.all(np.isfinite(u)):
+            u = np.nan_to_num(u, nan=0.0, posinf=1e6, neginf=-1e6)
+
+    nt = int(T / dt)
+    if n_probe is None:
+        n_probe = N
+    n_probe = int(max(1, min(N, n_probe)))
+    probe_idx = np.arange(n_probe)
+    U_probe = np.zeros((nt, n_probe))
+    R_pop = np.zeros(nt, dtype=float) if return_spike else None
+    for t in range(nt):
+        phi += F(u) * dt
+        spikes = phi >= np.pi
+        phi[spikes] -= 2.0 * np.pi
+        with np.errstate(over="ignore", divide="ignore", invalid="ignore"):
+            drive = W @ spikes.astype(float)
+        u += dt * (-beta * u + beta * drive)
+        if not np.all(np.isfinite(u)):
+            u = np.nan_to_num(u, nan=0.0, posinf=1e6, neginf=-1e6)
+        U_probe[t] = u[probe_idx]
+        if return_spike:
+            R_pop[t] = np.mean(spikes.astype(float)) / dt
+
+    max_lag = int(tau_max / dt)
+    C = np.mean([autocorr(U_probe[:, i], max_lag) for i in range(n_probe)], axis=0)
+    tau = np.arange(max_lag) * dt
+    if not return_spike:
+        return tau, C
+
+    C_spk = autocorr(R_pop, max_lag)
+    return tau, C, C_spk
+
+
+def theory_phase_autocorr(
+    I=1.0,
+    alpha=1.0,
+    sigma=7.0,
+    beta=1.0,
+    C0=None,
+    tau_max=50,
+    dtau=0.01,
+    n_quad=24,
+):
+    """
+    Reduced phase 2PI closure mapped to the rate-theory solver.
+
+    For this model, the closure has the same scalar structure as the rate case,
+    with effective gain g(u) = rho * F(u), rho = 1/(2*pi).
+    """
+    rho = 1.0 / (2.0 * np.pi)
+
+    def g(u):
+        return rho * alpha * np.maximum(I + u, 0.0) ** (1.0 / alpha)
+
+    Fprime0 = float(np.maximum(I, 1e-10) ** (1.0 / alpha - 1.0))
+    sigma_c = 1.0 / (rho * Fprime0)
+
+    # C'' = beta^2 (C - Q) scales by s = beta*tau to the beta=1 equation.
+    tau_scale = max(float(beta), 1e-10)
+    tau_s, C_s = theory_rate_autocorr(
+        C0=C0,
+        sigma=sigma,
+        tau_max=tau_max * tau_scale,
+        dtau=dtau * tau_scale,
+        f=g,
+        n_quad=n_quad,
+    )
+    return tau_s / tau_scale, C_s, sigma_c
+
+
+def theory_phase_spike_autocorr(
+    I=1.0,
+    alpha=1.0,
+    sigma=7.0,
+    beta=1.0,
+    C_uu=None,
+    tau_max=50,
+    dtau=0.01,
+    n_quad=24,
+):
+    """
+    Phase-model spike autocorrelation from the phi-rate closure.
+
+    Uses
+        C_spk(tau) = rho^2 * E[F(u(0)) F(u(tau))], rho = 1/(2*pi),
+    where (u(0), u(tau)) is Gaussian with covariance from C_uu.
+    """
+    rho = 1.0 / (2.0 * np.pi)
+
+    def F(u):
+        return alpha * np.maximum(I + u, 0.0) ** (1.0 / alpha)
+
+    if C_uu is None:
+        tau, C_uu, sigma_c = theory_phase_autocorr(
+            I=I,
+            alpha=alpha,
+            sigma=sigma,
+            beta=beta,
+            tau_max=tau_max,
+            dtau=dtau,
+            n_quad=n_quad,
+        )
+    else:
+        tau = np.arange(len(C_uu)) * dtau
+        Fprime0 = float(np.maximum(I, 1e-10) ** (1.0 / alpha - 1.0))
+        sigma_c = 1.0 / (rho * Fprime0)
+
+    C0 = float(C_uu[0]) if len(C_uu) > 0 else 0.0
+    if C0 <= 0:
+        return tau, np.zeros_like(tau), sigma_c
+
+    gh_x, gh_w = np.polynomial.hermite.hermgauss(n_quad)
+    gh_w2 = np.outer(gh_w, gh_w)
+    scale = np.sqrt(2.0 * C0)
+
+    def pair_expectation(C_tau):
+        rho_tau = float(np.clip(C_tau / C0, -0.999999, 0.999999))
+        x = scale * gh_x[:, None]
+        y = scale * (
+            rho_tau * gh_x[:, None] + np.sqrt(1.0 - rho_tau**2) * gh_x[None, :]
+        )
+        return float(np.sum(gh_w2 * F(x) * F(y)) / np.pi)
+
+    C_spk_raw = rho**2 * np.array([pair_expectation(c_tau) for c_tau in C_uu])
+
+    # Centered correlation: Cov[r(0), r(tau)] = E[r0 r_tau] - E[r]^2.
+    u_1d = scale * gh_x
+    mean_rate = rho * float(np.dot(gh_w, F(u_1d)) / np.sqrt(np.pi))
+    C_spk = C_spk_raw - mean_rate**2
+    return tau, C_spk, sigma_c
+
+
+def plot_phase_spike_correlation(
+    I=1.0,
+    alpha=1.0,
+    beta=1.0,
+    sigma=None,
+    N=512,
+    T=8000.0,
+    dt=0.02,
+    dtau=0.02,
+    tau_max=120.0,
+):
+    """Compare phase-model spike autocorrelation from simulation and theory."""
+    _, _, sigma_c = theory_phase_autocorr(
+        I=I,
+        alpha=alpha,
+        sigma=1.0,
+        beta=beta,
+        tau_max=5,
+        dtau=dtau,
+    )
+    if sigma is None:
+        sigma = 0.6 * sigma_c
+
+    tau_s, _Cuu_s, Cspk_s = sim_phase_network(
+        N=N,
+        I=I,
+        alpha=alpha,
+        sigma=sigma,
+        beta=beta,
+        T=T,
+        dt=dt,
+        tau_max=tau_max,
+        return_spike=True,
+    )
+    tau_t, Cspk_t, _ = theory_phase_spike_autocorr(
+        I=I,
+        alpha=alpha,
+        sigma=sigma,
+        beta=beta,
+        tau_max=max(float(tau_s[-1]), tau_max, 1.0),
+        dtau=dtau,
+    )
+
+    # Remove the zero-lag bin to avoid the finite-dt point-process spike peak.
+    tau_s_plot, Cspk_s_plot = tau_s[1:], Cspk_s[1:]
+    tau_t_plot, Cspk_t_plot = tau_t[1:], Cspk_t[1:]
+
+    def norm(x):
+        x0 = float(x[0]) if len(x) > 0 else 1.0
+        return x / x0 if abs(x0) > 1e-12 else x
+
+    fig, ax = plt.subplots(figsize=(7, 4.5))
+    ax.plot(tau_s_plot, norm(Cspk_s_plot), lw=1.8, label="Simulation")
+    ax.plot(tau_t_plot, norm(Cspk_t_plot), "--", lw=2.2, label="Theory (phi-rate)")
+    ax.set_xlabel(r"$\tau$")
+    ax.set_ylabel(r"$C_{spk}(\tau) / C_{spk}(0^+)$")
+    ax.set_title(
+        f"Phase spike correlation: sigma={sigma:.2f} (sigma_c={sigma_c:.2f})"
+    )
+    ax.set_xlim(0, 120)
+    ax.legend()
+    fig.tight_layout()
+    plt.savefig("phase_spike_correlation_test.png", dpi=150)
+    plt.show()
+
+
+def plot_phase_network(
+    I=1.0,
+    alpha=1.0,
+    beta=1.0,
+    N=512,
+    sigma_vals=None,
+    T=8000.0,
+    dt=0.02,
+    dtau=0.02,
+    tau_max=120.0,
+    sim_reps=3,
+):
+    """Compare phase-network simulation and reduced-theory autocorrelations."""
+    rho = 1.0 / (2.0 * np.pi)
+    Fprime0 = float(np.maximum(I, 1e-10) ** (1.0 / alpha - 1.0))
+    sigma_c = 1.0 / (rho * Fprime0)
+    print(f"Phase model: I={I}, alpha={alpha}, sigma_c={sigma_c:.3f}")
+
+    if sigma_vals is None:
+        sigma_vals = [0.75 * sigma_c, 0.95 * sigma_c, 1.1 * sigma_c]
+
+    fig, axes = plt.subplots(1, len(sigma_vals), figsize=(5 * len(sigma_vals), 4))
+    if len(sigma_vals) == 1:
+        axes = [axes]
+
+    for ax, sigma in zip(axes, sigma_vals):
+        g_val = sigma / sigma_c
+        print(f"\n-- phase sigma={sigma:.3f} (g={g_val:.2f}) --")
+
+        if sigma < sigma_c:
+            tau_th, C_th, _ = theory_phase_autocorr(
+                I=I,
+                alpha=alpha,
+                sigma=sigma,
+                beta=beta,
+                tau_max=tau_max,
+                dtau=dtau,
+            )
+        else:
+            tau_th, C_th = None, None
+            print("  above transition: no monotone decaying branch")
+
+        C_runs = []
+        tau_s = None
+        for _ in range(max(1, int(sim_reps))):
+            tau_run, C_run = sim_phase_network(
+                N=N,
+                I=I,
+                alpha=alpha,
+                sigma=sigma,
+                beta=beta,
+                T=T,
+                dt=dt,
+                tau_max=tau_max,
+                n_probe=N,
+            )
+            tau_s = tau_run
+            C_runs.append(C_run)
+        C_s = np.mean(C_runs, axis=0)
+
+        def norm(x):
+            x0 = float(x[0])
+            return x / x0 if abs(x0) > 1e-12 else x
+
+        ax.plot(tau_s, norm(C_s), "b", lw=1.5, alpha=0.85, label=f"Sim ({sim_reps} runs)")
+        if C_th is not None:
+            ax.plot(tau_th, norm(C_th), "r--", lw=2, label="2PI reduced")
+        ax.axhline(0, color="k", lw=0.5)
+        ax.set(
+            xlabel=r"$\tau$",
+            ylabel=r"$C_{uu}(\tau)/C_{uu}(0)$",
+            title=fr"$\sigma={sigma:.2f}$, $g={g_val:.2f}$",
+            xlim=(0, tau_max),
+        )
+        ax.legend(fontsize=8)
+
+    plt.suptitle(
+        fr"Phase neuron network: $I={I}$, $\alpha={alpha}$, $\sigma_c={sigma_c:.2f}$",
+        fontsize=13,
+        fontweight="bold",
+    )
+    plt.tight_layout()
+    plt.savefig("phase_network_test.png", dpi=150)
+    plt.show()
+
+
+# -----------------------------------------------------------------------------
 # 2. BINARY NEURON NETWORK
 #    n_i in {0,1}, 0->1 at rate f(u_i), 1->0 at rate mu
 #    u_i: synaptic drive, Gaussian weights, row-sum corrected
@@ -274,6 +599,7 @@ def sim_binary_network(
     burn=500,
     clip_rate_on=True,
     method="tau-leap",
+    return_spike=False,
     rng=rng,
 ):
     """
@@ -311,9 +637,13 @@ def sim_binary_network(
             )
         return rates
 
+    if return_spike and method != "tau-leap":
+        raise ValueError("return_spike=True is currently supported only for method='tau-leap'.")
+
     nt = int(T / dt)
     N_rec = np.zeros((nt, N))
     U_rec = np.zeros((nt, N))
+    SPK_rec = np.zeros((nt, N)) if return_spike else None
 
     if method == "tau-leap":
         nb = int(burn / dt)
@@ -326,7 +656,13 @@ def sim_binary_network(
             flip_off = rng.random(N) < p_off
             n += flip_on.astype(float) - flip_off.astype(float)
             n = np.clip(n, 0, 1)
-            u += dt * (-beta * u + beta * (W @ n))
+            with np.errstate(over="ignore", divide="ignore", invalid="ignore"):
+                drive = W @ n
+            if not np.all(np.isfinite(drive)):
+                drive = np.nan_to_num(drive, nan=0.0, posinf=1e6, neginf=-1e6)
+            u += dt * (-beta * u + beta * drive)
+            if not np.all(np.isfinite(u)):
+                u = np.nan_to_num(u, nan=0.0, posinf=1e6, neginf=-1e6)
 
         for t in range(nt):
             r_on = rate_on(u) * (1 - n)
@@ -337,9 +673,17 @@ def sim_binary_network(
             flip_off = rng.random(N) < p_off
             n += flip_on.astype(float) - flip_off.astype(float)
             n = np.clip(n, 0, 1)
-            u += dt * (-beta * u + beta * (W @ n))
+            with np.errstate(over="ignore", divide="ignore", invalid="ignore"):
+                drive = W @ n
+            if not np.all(np.isfinite(drive)):
+                drive = np.nan_to_num(drive, nan=0.0, posinf=1e6, neginf=-1e6)
+            u += dt * (-beta * u + beta * drive)
+            if not np.all(np.isfinite(u)):
+                u = np.nan_to_num(u, nan=0.0, posinf=1e6, neginf=-1e6)
             N_rec[t] = n
             U_rec[t] = u
+            if return_spike:
+                SPK_rec[t] = flip_on.astype(float)
     else:
         # Event-driven SSA for binary transitions, with exact between-event u evolution.
         t = 0.0
@@ -404,7 +748,14 @@ def sim_binary_network(
     Cnn = np.mean([autocorr(N_rec[:, i], max_lag) for i in range(min(N, 64))], axis=0)
     Cuu = np.mean([autocorr(U_rec[:, i], max_lag) for i in range(min(N, 64))], axis=0)
     tau = np.arange(max_lag) * dt
-    return tau, Cnn, Cuu
+    if not return_spike:
+        return tau, Cnn, Cuu
+
+    Cspk = np.mean(
+        [autocorr(SPK_rec[:, i] / dt, max_lag) for i in range(min(N, 64))],
+        axis=0,
+    )
+    return tau, Cnn, Cuu, Cspk
 
 
 def theory_binary_autocorr(sigma, beta, mu, f0, f1, tau_max=30, dtau=0.001):
@@ -482,6 +833,51 @@ def theory_binary_autocorr(sigma, beta, mu, f0, f1, tau_max=30, dtau=0.001):
     return tau, Cnn, Cuu, g
 
 
+def theory_binary_spike_autocorr(
+    sigma,
+    beta,
+    mu,
+    f0,
+    f1,
+    tau_max=30,
+    dtau=0.001,
+    n_quad=32,
+):
+    """
+    Approximate binary-network spike autocorrelation using the quasi-static map.
+
+    We map spike intensity to nu_eff(u)=f(u)^2/(f(u)+mu) with clipped
+    f(u)=max(f0+f1*u,0), then compute
+        C_spk(tau) ~ E[nu_eff(u(0)) nu_eff(u(tau))]
+    under the Gaussian pair implied by theory C_uu.
+    """
+    tau, _Cnn, Cuu, g = theory_binary_autocorr(
+        sigma=sigma,
+        beta=beta,
+        mu=mu,
+        f0=f0,
+        f1=f1,
+        tau_max=tau_max,
+        dtau=dtau,
+    )
+    Cuu0 = float(Cuu[0]) if len(Cuu) > 0 else 0.0
+    if Cuu0 <= 0:
+        return tau, np.zeros_like(tau), g
+
+    # C_uu is already the u-covariance, so no extra sigma prefactor here.
+    Cspk_raw = np.array(
+        [
+            _Q_clipped_correct(Cuu[k], Cuu0, f0, f1, mu, sigma, n_quad=n_quad)
+            for k in range(len(tau))
+        ]
+    )
+    gh_x, gh_w = np.polynomial.hermite.hermgauss(n_quad)
+    u = np.sqrt(Cuu0) * gh_x * np.sqrt(2.0)
+    mean_rate = float(np.dot(gh_w, _nu_eff(u, f0, f1, mu)) / np.sqrt(np.pi))
+    Cspk = Cspk_raw - mean_rate**2
+    return tau, Cspk, g
+
+
 def _nu_eff(u, f0, f1, mu):
     """
     Effective rate under quasi-static n(u): nu_eff(u) = f(u)^2 / (f(u)+mu).
@@ -499,7 +895,8 @@ def _Q_clipped_correct(C_uu_tau, C_uu_0, f0, f1, mu, sigma, n_quad=32):
     if C_uu_0 <= 0:
         return float(_nu_eff(0.0, f0, f1, mu) ** 2)
 
-    s = sigma * np.sqrt(C_uu_0)
+    # C_uu is already the u-covariance, so no extra sigma prefactor here.
+    s = np.sqrt(C_uu_0)
     rho = float(np.clip(C_uu_tau / C_uu_0, -0.999999, 0.999999))
     xi = gh_x[:, None] * np.sqrt(2.0)
     yi = gh_x[None, :] * np.sqrt(2.0)

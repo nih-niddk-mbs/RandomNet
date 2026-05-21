@@ -12,7 +12,7 @@ from scipy.special import erf
 
 def load_module():
     spec = importlib.util.spec_from_file_location(
-        "simmod", Path(__file__).with_name("two_pi_random_network_tests.py")
+        "simmod", Path(__file__).with_name("random_network.py")
     )
     mod = importlib.util.module_from_spec(spec)
     spec.loader.exec_module(mod)
@@ -23,6 +23,9 @@ def main():
     mod = load_module()
     out_dir = Path(__file__).resolve().parents[1] / "plots"
     out_dir.mkdir(parents=True, exist_ok=True)
+
+    # Use a larger default rate-network size to reduce finite-size bias.
+    rate_N = 1024
 
     # Shared binary-network parameters. gamma, n_bar, c1 are determined by these,
     # so expose them once here rather than implicitly fixing them in each call.
@@ -106,7 +109,7 @@ def main():
     # Average a couple of simulation runs to reduce tail noise, while keeping the
     # theory branch fixed and reproducible.
     chaotic_sigma = 2.0
-    rate_params = dict(N=512, sigma=chaotic_sigma, T=1500.0, dt=0.05, burn=250, lam=1)
+    rate_params = dict(N=rate_N, sigma=chaotic_sigma, T=1500.0, dt=0.05, burn=250, lam=1)
     rate_reps = 2
     tau_s = None
     C_runs = []
@@ -139,12 +142,107 @@ def main():
     fig.savefig(p3, dpi=160)
     plt.close(fig)
 
+    # 3b) Phase-neuron model comparison (kept separate from the rate model).
+    phase_I = 1.0
+    phase_alpha = 1.0
+    phase_beta = 1.0
+    _, _, phase_sigma_c = mod.theory_phase_autocorr(
+        I=phase_I,
+        alpha=phase_alpha,
+        sigma=1.0,
+        beta=phase_beta,
+        tau_max=5,
+        dtau=0.02,
+    )
+    phase_sigma = 0.6 * phase_sigma_c
+    tau_ps, C_ps = mod.sim_phase_network(
+        N=512,
+        I=phase_I,
+        alpha=phase_alpha,
+        sigma=phase_sigma,
+        beta=phase_beta,
+        T=1800.0,
+        dt=0.02,
+        burn=250,
+    )
+    tau_pt, C_pt, _ = mod.theory_phase_autocorr(
+        I=phase_I,
+        alpha=phase_alpha,
+        sigma=phase_sigma,
+        beta=phase_beta,
+        tau_max=30,
+        dtau=0.02,
+    )
+
+    fig, ax = plt.subplots(figsize=(7, 4.5))
+    ax.plot(tau_ps, C_ps / max(C_ps[0], 1e-12), lw=1.8, label="Simulation")
+    ax.plot(tau_pt, C_pt / max(C_pt[0], 1e-12), "--", lw=2.2, label="Theory")
+    ax.set_xlabel("tau")
+    ax.set_ylabel("C_uu(tau) / C_uu(0)")
+    ax.set_title(
+        f"Phase neuron network: sigma={phase_sigma:.2f} (sigma_c={phase_sigma_c:.2f})"
+    )
+    ax.set_xlim(0, 20)
+    ax.legend()
+    fig.tight_layout()
+    p3b = out_dir / "quick_phase_sigma_subcritical.png"
+    fig.savefig(p3b, dpi=160)
+    plt.close(fig)
+
+    # 3c) Phase-neuron spike-correlation comparison from phi-rate closure.
+    tau_pspk_s, _Cuu_pspk, Cspk_s = mod.sim_phase_network(
+        N=512,
+        I=phase_I,
+        alpha=phase_alpha,
+        sigma=phase_sigma,
+        beta=phase_beta,
+        T=1800.0,
+        dt=0.02,
+        burn=250,
+        return_spike=True,
+    )
+    tau_pspk_t, Cspk_t, _ = mod.theory_phase_spike_autocorr(
+        I=phase_I,
+        alpha=phase_alpha,
+        sigma=phase_sigma,
+        beta=phase_beta,
+        tau_max=30,
+        dtau=0.02,
+    )
+
+    # Drop zero lag to avoid finite-dt spike-count peak dominating normalization.
+    tau_pspk_s = tau_pspk_s[1:]
+    Cspk_s = Cspk_s[1:]
+    tau_pspk_t = tau_pspk_t[1:]
+    Cspk_t = Cspk_t[1:]
+
+    fig, ax = plt.subplots(figsize=(7, 4.5))
+    ax.plot(tau_pspk_s, Cspk_s / max(Cspk_s[0], 1e-12), lw=1.8, label="Simulation")
+    ax.plot(
+        tau_pspk_t,
+        Cspk_t / max(Cspk_t[0], 1e-12),
+        "--",
+        lw=2.2,
+        label="Theory (phi-rate)",
+    )
+    ax.set_xlabel("tau")
+    ax.set_ylabel("C_spk(tau) / C_spk(0+)")
+    ax.set_title(
+        f"Phase spike correlation: sigma={phase_sigma:.2f} (sigma_c={phase_sigma_c:.2f})"
+    )
+    ax.set_xlim(0, 20)
+    ax.legend()
+    fig.tight_layout()
+    p3c = out_dir / "quick_phase_spike_sigma_subcritical.png"
+    fig.savefig(p3c, dpi=160)
+    plt.close(fig)
+
     # 4) Chaotic-rate sigma sweep with longer traces and a wider lag window.
     chaotic_sigmas = (1.8, 2.0, 2.4)
     fig, axes = plt.subplots(1, len(chaotic_sigmas), figsize=(5.2 * len(chaotic_sigmas), 4.5), sharey=True)
 
     for ax, chaotic_sigma in zip(np.atleast_1d(axes), chaotic_sigmas):
-        rate_params = dict(N=512, sigma=chaotic_sigma, T=2200.0, dt=0.05, burn=300, lam=1)
+        rate_params = dict(N=rate_N, sigma=chaotic_sigma, T=2200.0, dt=0.05, burn=300, lam=1)
         rate_reps = 2
         tau_s = None
         C_runs = []
@@ -191,7 +289,7 @@ def main():
 
     for ax, (link_name, link_fn) in zip(np.atleast_1d(axes), link_examples):
         rate_params = dict(
-            N=512,
+            N=rate_N,
             sigma=link_sigma,
             T=3200.0,
             dt=0.05,
@@ -243,7 +341,7 @@ def main():
 
     # 6) Network-size invariance check (rate network).
     # If the scaling is correct, normalized correlations should collapse as N grows.
-    N_values = (256, 512, 1024)
+    N_values = (512, 1024, 2048)
     sigma_inv = 1.8
     fig, ax = plt.subplots(figsize=(8.2, 4.8))
     for N in N_values:
@@ -276,6 +374,8 @@ def main():
     print(str(p4))
     print(str(p5))
     print(str(p6))
+    print(str(p3b))
+    print(str(p3c))
 
 
 if __name__ == "__main__":

@@ -5,7 +5,7 @@ from scipy.interpolate import interp1d
 
 # Add python/simulations to path
 sys.path.append(os.path.join(os.getcwd(), 'python/simulations'))
-import two_pi_random_network_tests as tp
+import random_network as tp
 
 # 1. Run simulation
 N=512; sigma=1.5; T=1200; dt=0.05; burn=200; lam=1

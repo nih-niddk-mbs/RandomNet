@@ -11,7 +11,14 @@ Code to simulate and analyze randomly connected neural networks.
 
 ## Python simulations
 
-The script `python/simulations/two_pi_random_network_tests.py` runs the 2PI test simulations and plotting workflows.
+The script `python/simulations/random_network.py` runs the 2PI test simulations and plotting workflows.
+
+Terminology note:
+- The continuous-state model `du_i/dt = -u_i + sum_j W_ij f(u_j)` is the
+	rate network.
+- A separate phase-neuron model is also implemented in
+	`python/simulations/random_network.py` (`sim_phase_network`,
+	`theory_phase_autocorr`, `plot_phase_network`).
 
 ### Conda environment (recommended)
 
@@ -25,7 +32,7 @@ conda activate randomnet-py
 Run:
 
 ```bash
-python python/simulations/two_pi_random_network_tests.py
+python python/simulations/random_network.py
 ```
 
 Install Python dependencies:
@@ -37,5 +44,5 @@ python -m pip install -r python/requirements.txt
 Run:
 
 ```bash
-python python/simulations/two_pi_random_network_tests.py
+python python/simulations/random_network.py
 ```
