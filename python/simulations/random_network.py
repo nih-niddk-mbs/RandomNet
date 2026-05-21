@@ -351,14 +351,44 @@ def theory_phase_autocorr(
     Fprime0 = float(np.maximum(I, 1e-10) ** (1.0 / alpha - 1.0))
     sigma_c = 1.0 / (rho * Fprime0)
 
-    # C'' = beta^2 (C - Q) scales by s = beta*tau to the beta=1 equation.
+    # Gauss-Hermite nodes for centering g.
+    gh_x, gh_w = np.polynomial.hermite.hermgauss(n_quad)
+
+    def mu_g(C0_val):
+        """E[g(u)] under u ~ N(0, C0_val) via GH quadrature."""
+        if C0_val <= 0:
+            return g(0.0)
+        s = np.sqrt(2.0 * float(C0_val))
+        return float(np.sum(gh_w * g(s * gh_x)) / np.sqrt(np.pi))
+
+    # With row-sum corrected W, only the centered gain enters the SCS closure.
+    # Pass g_c = g - E[g] to theory_rate_autocorr.  Because the mean depends on
+    # C0, we do one warm-up pass with raw g to get an approximate C0, then
+    # center and solve properly.
     tau_scale = max(float(beta), 1e-10)
-    tau_s, C_s = theory_rate_autocorr(
+
+    # Pass 1: rough C0 with raw g (gives wrong amplitude but usable C0 estimate)
+    _, C_warm = theory_rate_autocorr(
         C0=C0,
         sigma=sigma,
         tau_max=tau_max * tau_scale,
         dtau=dtau * tau_scale,
         f=g,
+        n_quad=n_quad,
+    )
+    C0_est = float(C_warm[0])
+    mean_g = mu_g(C0_est)
+
+    def g_centered(u):
+        return g(u) - mean_g
+
+    # Pass 2: solve with centered gain
+    tau_s, C_s = theory_rate_autocorr(
+        C0=None,
+        sigma=sigma,
+        tau_max=tau_max * tau_scale,
+        dtau=dtau * tau_scale,
+        f=g_centered,
         n_quad=n_quad,
     )
     return tau_s / tau_scale, C_s, sigma_c
