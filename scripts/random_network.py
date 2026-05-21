@@ -228,7 +228,7 @@ def plot_rate_network(sigma=1.5, N=512, C0_guess=0.8, plot_dir=None):
     """Compare simulation vs theory for rate network."""
     import os
     if plot_dir is None:
-        plot_dir = os.path.join(os.path.dirname(os.path.abspath(__file__)), "..", "plots")
+        plot_dir = os.path.join(os.path.dirname(os.path.abspath(__file__)), "..", "data", "plots")
     os.makedirs(plot_dir, exist_ok=True)
     print(f"Simulating rate network: N={N}, sigma={sigma} ...")
     tau_sim, C_sim = sim_rate_network(N=N, sigma=sigma)
@@ -268,7 +268,7 @@ def plot_rate_network(sigma=1.5, N=512, C0_guess=0.8, plot_dir=None):
     plt.tight_layout()
     plt.savefig(os.path.join(plot_dir, "rate_network_test.png"), dpi=150)
     print(f"Saved to {os.path.join(plot_dir, 'rate_network_test.png')}")
-    plt.show()
+    plt.close("all")
 
 
 # -----------------------------------------------------------------------------
@@ -357,13 +357,24 @@ def theory_phase_autocorr(
     n_quad=24,
 ):
     """
-    Reduced phase 2PI closure mapped to the rate-theory solver.
+    Solve the 2PI SCS equation for the phase neuron network.
 
-    For this model, the closure has the same scalar structure as the rate case,
-    with effective gain g(u) = rho * F(u), rho = 1/(2*pi).
-    
-    Since g(u) = rho * max(I+u, 0) has nonzero mean for I > 0, we compute the
-    centered covariance Q_centered = E[g(u0)g(uτ)] - E[g]^2 in the SCS closure.
+    Returns C_11(tau) = C_tilde(tau) + C_eq, where:
+
+      C_eq   = sigma^2 * <g(u)>^2  (long-lag baseline, found by bisection on
+               the scalar fixed-point C = sigma^2 * mu_g(C)^2)
+
+      C_tilde satisfies the SCS ODE with centered Q_tilde
+               = sigma^2 * Cov(g(u0), g(u_tau))
+
+    Bug fix: the SCS solver draws x ~ N(0, C_tilde_trial) internally, but the
+    actual drive has variance C_11(0) = C_tilde(0) + C_eq.  We correct this by
+    passing a shifted gain
+
+        g_shifted(x) = E_{u_eq ~ N(0, C_eq)}[g(x + u_eq)]
+
+    so that, when the solver evaluates g_shifted at x ~ N(0, C_tilde), the
+    effective argument x + u_eq ~ N(0, C_tilde + C_eq) = N(0, C_11(0)).
     """
     rho = 1.0 / (2.0 * np.pi)
 
@@ -373,33 +384,84 @@ def theory_phase_autocorr(
     Fprime0 = float(np.maximum(I, 1e-10) ** (1.0 / alpha - 1.0))
     sigma_c = 1.0 / (rho * Fprime0)
 
-    # Gauss-Hermite nodes for computing E[g] self-consistently
     gh_x, gh_w = np.polynomial.hermite.hermgauss(n_quad)
 
-    def mu_g(C0_val):
-        """E[g(u)] under u ~ N(0, C0_val) via GH quadrature."""
-        if C0_val <= 0:
-            return g(0.0)
-        s = np.sqrt(2.0 * float(C0_val))
+    def mu_g(C_val):
+        """E[g(u)] under u ~ N(0, C_val) via GH quadrature."""
+        C_val = float(C_val)
+        if C_val <= 0:
+            return float(g(0.0))
+        s = np.sqrt(2.0 * C_val)
         return float(np.sum(gh_w * g(s * gh_x)) / np.sqrt(np.pi))
 
-    tau_scale = max(float(beta), 1e-10)
-    
-    # For phase model with I > 0, variance can be large. Use wider bounds.
-    C0_bounds_phase = (0.1, 500.0)
+    # ── Step 1: find C_eq by bisection on h(C) = C - sigma^2 * mu_g(C)^2 ───
+    # h(0) = -sigma^2*g(0)^2 < 0.  Expand hi until h(hi) > 0; if it never
+    # turns positive the gain is too linear and C_eq = 0 is the best answer.
+    C_eq = 0.0
+    lo = 0.0
+    hi = max(1e-3, sigma**2 * float(g(0.0))**2)
+    h_hi = hi - sigma**2 * mu_g(hi)**2
+    for _ in range(64):
+        if h_hi > 0:
+            break
+        lo = hi
+        hi *= 4.0
+        if hi > 1e8:
+            break
+        h_hi = hi - sigma**2 * mu_g(hi)**2
+    if h_hi > 0:
+        for _ in range(80):
+            mid = 0.5 * (lo + hi)
+            h_mid = mid - sigma**2 * mu_g(mid)**2
+            if abs(h_mid) < 1e-9 * max(1.0, abs(mid)):
+                C_eq = mid
+                break
+            if h_mid < 0:
+                lo = mid
+            else:
+                hi = mid
+        C_eq = 0.5 * (lo + hi)
 
-    # Solve SCS with centered Q: Q -> Q - mu_g^2
-    tau_s, C_s = theory_rate_autocorr(
+    # ── Step 2: build g_shifted absorbing C_eq into the distribution ─────────
+    # g_shifted(x) = E_{u_eq ~ N(0,C_eq)}[g(x + u_eq)]
+    # Vectorised: accepts any array shape, marginalises over C_eq via 1-D GH.
+    if C_eq > 1e-14:
+        s_eq = np.sqrt(2.0 * C_eq)
+        eq_nodes = s_eq * gh_x          # (n_quad,)  scaled GH nodes
+        eq_wts   = gh_w / np.sqrt(np.pi)  # (n_quad,)  normalised weights
+
+        def g_shifted(x):
+            x = np.asarray(x, dtype=float)
+            orig_shape = x.shape
+            xf = x.ravel()                          # (M,)
+            u  = xf[:, np.newaxis] + eq_nodes       # (M, n_quad)
+            return (g(u) @ eq_wts).reshape(orig_shape)
+
+        def mu_g_shifted(C_tilde_val):
+            # E[g_shifted(x)] for x~N(0,C_tilde) = E[g(u)] for u~N(0,C_tilde+C_eq)
+            return mu_g(float(C_tilde_val) + C_eq)
+    else:
+        g_shifted     = g
+        mu_g_shifted  = mu_g
+
+    # ── Step 3: solve SCS for C_tilde using the shifted gain ─────────────────
+    tau_scale       = max(float(beta), 1e-10)
+    C0_bounds_phase = (1e-4, 500.0)
+
+    tau_s, C_tilde = theory_rate_autocorr(
         C0=C0,
         sigma=sigma,
         tau_max=tau_max * tau_scale,
         dtau=dtau * tau_scale,
-        f=g,
+        f=g_shifted,
         n_quad=n_quad,
         C0_bounds=C0_bounds_phase,
-        mu_f=mu_g,  # Pass mean function for centering
+        mu_f=mu_g_shifted,
     )
-    return tau_s / tau_scale, C_s, sigma_c
+
+    # ── Step 4: restore full correlator C_11 = C_tilde + C_eq ────────────────
+    C11 = C_tilde + C_eq
+    return tau_s / tau_scale, C11, sigma_c
 
 
 def theory_phase_spike_autocorr(
@@ -479,7 +541,7 @@ def plot_phase_spike_correlation(
     """Compare phase-model spike autocorrelation from simulation and theory."""
     import os
     if plot_dir is None:
-        plot_dir = os.path.join(os.path.dirname(os.path.abspath(__file__)), "..", "plots")
+        plot_dir = os.path.join(os.path.dirname(os.path.abspath(__file__)), "..", "data", "plots")
     os.makedirs(plot_dir, exist_ok=True)
     _, _, sigma_c = theory_phase_autocorr(
         I=I,
@@ -535,7 +597,7 @@ def plot_phase_spike_correlation(
     os.makedirs(plot_dir, exist_ok=True)
     plt.savefig(os.path.join(plot_dir, "phase_spike_correlation_test.png"), dpi=150)
     print(f"Saved to {os.path.join(plot_dir, 'phase_spike_correlation_test.png')}")
-    plt.show()
+    plt.close("all")
 
 
 def plot_phase_network(
@@ -554,7 +616,7 @@ def plot_phase_network(
     """Compare phase-network simulation and reduced-theory autocorrelations."""
     import os
     if plot_dir is None:
-        plot_dir = os.path.join(os.path.dirname(os.path.abspath(__file__)), "..", "plots")
+        plot_dir = os.path.join(os.path.dirname(os.path.abspath(__file__)), "..", "data", "plots")
     os.makedirs(plot_dir, exist_ok=True)
     rho = 1.0 / (2.0 * np.pi)
     Fprime0 = float(np.maximum(I, 1e-10) ** (1.0 / alpha - 1.0))
@@ -572,7 +634,7 @@ def plot_phase_network(
         g_val = sigma / sigma_c
         print(f"\n-- phase sigma={sigma:.3f} (g={g_val:.2f}) --")
 
-        if sigma < sigma_c:
+        try:
             tau_th, C_th, _ = theory_phase_autocorr(
                 I=I,
                 alpha=alpha,
@@ -581,9 +643,9 @@ def plot_phase_network(
                 tau_max=tau_max,
                 dtau=dtau,
             )
-        else:
+        except Exception as e:
+            print(f"  theory failed: {e}")
             tau_th, C_th = None, None
-            print("  above transition: no monotone decaying branch")
 
         C_runs = []
         tau_s = None
@@ -629,7 +691,7 @@ def plot_phase_network(
     plt.tight_layout()
     plt.savefig(os.path.join(plot_dir, "phase_network_test.png"), dpi=150)
     print(f"Saved to {os.path.join(plot_dir, 'phase_network_test.png')}")
-    plt.show()
+    plt.close("all")
 
 
 # -----------------------------------------------------------------------------
@@ -1099,7 +1161,7 @@ def plot_clipped_vs_linear(
     """Compare clipped simulation with clipped-vs-linear theory predictions."""
     import os
     if plot_dir is None:
-        plot_dir = os.path.join(os.path.dirname(os.path.abspath(__file__)), "..", "plots")
+        plot_dir = os.path.join(os.path.dirname(os.path.abspath(__file__)), "..", "data", "plots")
     os.makedirs(plot_dir, exist_ok=True)
     cached = {}
     cache_updated = False
@@ -1192,7 +1254,7 @@ def plot_clipped_vs_linear(
     plt.tight_layout()
     plt.savefig(os.path.join(plot_dir, "clipped_vs_linear.png"), dpi=150)
     print(f"Saved to {os.path.join(plot_dir, 'clipped_vs_linear.png')}")
-    plt.show()
+    plt.close("all")
 
     if sim_cache_path is not None and (cache_updated or force_resim):
         to_save = {"sigmas": np.array(sorted(cached.keys()), dtype=float)}
@@ -1222,7 +1284,7 @@ def plot_binary_network(
     """
     import os
     if plot_dir is None:
-        plot_dir = os.path.join(os.path.dirname(os.path.abspath(__file__)), "..", "plots")
+        plot_dir = os.path.join(os.path.dirname(os.path.abspath(__file__)), "..", "data", "plots")
     os.makedirs(plot_dir, exist_ok=True)
     fig, axes = plt.subplots(2, len(sigma_vals), figsize=(5 * len(sigma_vals), 8))
     if len(sigma_vals) == 1:
@@ -1280,7 +1342,7 @@ def plot_binary_network(
     plt.tight_layout()
     plt.savefig(os.path.join(plot_dir, "binary_network_test.png"), dpi=150)
     print(f"Saved to {os.path.join(plot_dir, 'binary_network_test.png')}")
-    plt.show()
+    plt.close("all")
 
 
 # -----------------------------------------------------------------------------
@@ -1326,7 +1388,7 @@ def plot_two_timescale_fit(
     """
     import os
     if plot_dir is None:
-        plot_dir = os.path.join(os.path.dirname(os.path.abspath(__file__)), "..", "plots")
+        plot_dir = os.path.join(os.path.dirname(os.path.abspath(__file__)), "..", "data", "plots")
     os.makedirs(plot_dir, exist_ok=True)
     tau_th, Cnn_th, _, g = theory_binary_autocorr(sigma, beta, mu, f0, f1)
     tau_s, Cnn_s, _ = sim_binary_network(
@@ -1387,7 +1449,7 @@ def plot_two_timescale_fit(
     os.makedirs(plot_dir, exist_ok=True)
     plt.savefig(os.path.join(plot_dir, "two_timescale_fit.png"), dpi=150)
     print(f"Saved to {os.path.join(plot_dir, 'two_timescale_fit.png')}")
-    plt.show()
+    plt.close("all")
 
 
 # -----------------------------------------------------------------------------
@@ -1406,7 +1468,7 @@ def plot_binary_network_N_convergence(sigma=0.8, N_vals=(128, 300, 800, 1600),
     """
     import os
     if plot_dir is None:
-        plot_dir = os.path.join(os.path.dirname(os.path.abspath(__file__)), "..", "plots")
+        plot_dir = os.path.join(os.path.dirname(os.path.abspath(__file__)), "..", "data", "plots")
     os.makedirs(plot_dir, exist_ok=True)
     print(f"\n-- Binary network: N convergence at sigma={sigma} --")
     tau_th, Cnn_th, Cuu_th, g = theory_binary_autocorr(sigma, beta, mu, f0, f1)
@@ -1459,7 +1521,417 @@ def plot_binary_network_N_convergence(sigma=0.8, N_vals=(128, 300, 800, 1600),
     plt.tight_layout()
     plt.savefig(os.path.join(plot_dir, "binary_network_N_convergence.png"), dpi=150)
     print(f"Saved to {os.path.join(plot_dir, 'binary_network_N_convergence.png')}")
-    plt.show()
+    plt.close("all")
+
+
+# -----------------------------------------------------------------------------
+# Phase model: timeseries and raster helpers
+# -----------------------------------------------------------------------------
+
+def _sim_phase_timeseries(
+    N=256,
+    I=1.0,
+    alpha=1.0,
+    sigma=7.0,
+    beta=1.0,
+    T=500.0,
+    dt=0.02,
+    n_show=20,
+    burn=200.0,
+    rng_=None,
+):
+    """Simulate phase network and return raw u timeseries and per-neuron spike times.
+
+    Returns
+    -------
+    t         : (nt,) time array
+    U         : (nt, n_show) u-values for the first n_show neurons
+    spk_times : list of n_show arrays, each holding spike times for that neuron
+    """
+    if rng_ is None:
+        rng_ = np.random.default_rng(42)
+    n_show = min(n_show, N)
+    W = make_weights(N, sigma, lam=1, rng=rng_)
+    phi = rng_.uniform(-np.pi, np.pi, N)
+    u = np.zeros(N)
+
+    def F(u_):
+        return alpha * np.maximum(I + u_, 0.0) ** (1.0 / alpha)
+
+    nb = int(burn / dt)
+    for _ in range(nb):
+        phi += F(u) * dt
+        spikes = phi >= np.pi
+        phi[spikes] -= 2.0 * np.pi
+        drive = W @ spikes.astype(float)
+        u += -beta * u * dt + beta * drive
+        if not np.all(np.isfinite(u)):
+            u = np.nan_to_num(u, nan=0.0, posinf=1e6, neginf=-1e6)
+
+    nt = int(T / dt)
+    t = np.arange(nt) * dt
+    idx = np.arange(n_show)
+    U = np.zeros((nt, n_show))
+    spk_times = [[] for _ in range(n_show)]
+
+    for step in range(nt):
+        phi += F(u) * dt
+        spikes = phi >= np.pi
+        phi[spikes] -= 2.0 * np.pi
+        drive = W @ spikes.astype(float)
+        u += -beta * u * dt + beta * drive
+        if not np.all(np.isfinite(u)):
+            u = np.nan_to_num(u, nan=0.0, posinf=1e6, neginf=-1e6)
+        U[step] = u[idx]
+        for k in range(n_show):
+            if spikes[idx[k]]:
+                spk_times[k].append(t[step])
+
+    return t, U, [np.array(st) for st in spk_times]
+
+
+def _phase_sigma_c(I, alpha):
+    rho = 1.0 / (2.0 * np.pi)
+    Fprime0 = float(np.maximum(I, 1e-10) ** (1.0 / alpha - 1.0))
+    return 1.0 / (rho * Fprime0)
+
+
+# -----------------------------------------------------------------------------
+# 1. u(t) time series
+# -----------------------------------------------------------------------------
+
+def plot_u_timeseries(
+    sigma_vals=None,
+    I=1.0,
+    alpha=1.0,
+    beta=1.0,
+    N=256,
+    T=200.0,
+    dt=0.02,
+    n_show=8,
+    burn=100.0,
+    plot_dir=None,
+):
+    """Plot u(t) traces for several neurons across sigma values.
+
+    One column per sigma value; each panel shows n_show overlaid traces.
+    """
+    import os
+    if plot_dir is None:
+        plot_dir = os.path.join(os.path.dirname(os.path.abspath(__file__)), "..", "data", "plots")
+    os.makedirs(plot_dir, exist_ok=True)
+
+    sigma_c = _phase_sigma_c(I, alpha)
+    if sigma_vals is None:
+        sigma_vals = [0.5 * sigma_c, 1.0 * sigma_c, 2.0 * sigma_c]
+
+    ncols = len(sigma_vals)
+    fig, axes = plt.subplots(1, ncols, figsize=(5 * ncols, 4), sharey=False)
+    if ncols == 1:
+        axes = [axes]
+
+    for ax, sigma in zip(axes, sigma_vals):
+        g = sigma / sigma_c
+        print(f"  u timeseries: sigma={sigma:.2f} (g={g:.2f})")
+        t, U, _ = _sim_phase_timeseries(
+            N=N, I=I, alpha=alpha, sigma=sigma, beta=beta,
+            T=T, dt=dt, n_show=n_show, burn=burn,
+        )
+        for k in range(n_show):
+            ax.plot(t, U[:, k], lw=0.8, alpha=0.7)
+        ax.set(
+            xlabel="time",
+            ylabel=r"$u_i(t)$",
+            title=fr"$\sigma={sigma:.2f}$, $g=\sigma/\sigma_c={g:.2f}$",
+        )
+
+    plt.suptitle(
+        fr"Phase network: $u(t)$ time series  ($I={I}$, $\alpha={alpha}$, $\sigma_c={sigma_c:.2f}$)",
+        fontsize=12, fontweight="bold",
+    )
+    plt.tight_layout()
+    outpath = os.path.join(plot_dir, "phase_u_timeseries.png")
+    plt.savefig(outpath, dpi=150)
+    print(f"Saved to {outpath}")
+    plt.close("all")
+
+
+# -----------------------------------------------------------------------------
+# 2. Spike raster + population rate
+# -----------------------------------------------------------------------------
+
+def plot_phase_raster(
+    sigma_vals=None,
+    I=1.0,
+    alpha=1.0,
+    beta=1.0,
+    N=256,
+    T=500.0,
+    dt=0.02,
+    burn=100.0,
+    plot_dir=None,
+):
+    """Spike raster (neuron index vs time) + population rate for several sigma.
+
+    Two rows per sigma: raster (top), smoothed population firing rate (bottom).
+    """
+    import os
+    if plot_dir is None:
+        plot_dir = os.path.join(os.path.dirname(os.path.abspath(__file__)), "..", "data", "plots")
+    os.makedirs(plot_dir, exist_ok=True)
+
+    sigma_c = _phase_sigma_c(I, alpha)
+    if sigma_vals is None:
+        sigma_vals = [0.5 * sigma_c, 1.0 * sigma_c, 2.0 * sigma_c]
+
+    ncols = len(sigma_vals)
+    fig, axes = plt.subplots(
+        2, ncols, figsize=(5 * ncols, 6),
+        gridspec_kw={"height_ratios": [3, 1]},
+    )
+    if ncols == 1:
+        axes = axes.reshape(2, 1)
+
+    for col, sigma in enumerate(sigma_vals):
+        g = sigma / sigma_c
+        print(f"  raster: sigma={sigma:.2f} (g={g:.2f})")
+        t, _, spk_times = _sim_phase_timeseries(
+            N=N, I=I, alpha=alpha, sigma=sigma, beta=beta,
+            T=T, dt=dt, n_show=N, burn=burn,
+        )
+        ax_raster = axes[0, col]
+        ax_rate   = axes[1, col]
+
+        # Raster
+        for k, st in enumerate(spk_times):
+            if len(st):
+                ax_raster.scatter(st, np.full(len(st), k), s=0.5, c="k", linewidths=0)
+        ax_raster.set(
+            xlim=(0, T), ylim=(-1, N),
+            ylabel="neuron" if col == 0 else "",
+            title=fr"$\sigma={sigma:.2f}$, $g={g:.2f}$",
+        )
+        ax_raster.tick_params(labelbottom=False)
+
+        # Population rate (smoothed)
+        nt = len(t)
+        pop_rate = np.zeros(nt)
+        for st in spk_times:
+            for ts in st:
+                idx = int(ts / dt)
+                if idx < nt:
+                    pop_rate[idx] += 1.0
+        pop_rate /= N * dt
+        win = max(1, int(5.0 / dt))
+        pop_rate_sm = np.convolve(pop_rate, np.ones(win) / win, mode="same")
+        ax_rate.plot(t, pop_rate_sm, lw=1.0, color="steelblue")
+        ax_rate.set(
+            xlabel="time",
+            ylabel="rate" if col == 0 else "",
+            xlim=(0, T),
+        )
+
+    plt.suptitle(
+        fr"Phase network: spike raster  ($I={I}$, $\alpha={alpha}$, $\sigma_c={sigma_c:.2f}$)",
+        fontsize=12, fontweight="bold",
+    )
+    plt.tight_layout()
+    outpath = os.path.join(plot_dir, "phase_raster.png")
+    plt.savefig(outpath, dpi=150)
+    print(f"Saved to {outpath}")
+    plt.close("all")
+
+
+# -----------------------------------------------------------------------------
+# 3. Sim vs theory: parameter dependence
+# -----------------------------------------------------------------------------
+
+def plot_phase_corr_params(
+    param_sets=None,
+    N=512,
+    T=5000.0,
+    dt=0.02,
+    tau_max=80.0,
+    sim_reps=2,
+    plot_dir=None,
+):
+    """Sim vs theory C_uu(tau) for different parameter combinations.
+
+    param_sets : list of dicts with keys I, alpha, beta, sigma (absolute values),
+                 and optional 'label'. Theory is shown only when sigma < sigma_c.
+    """
+    import os
+    if plot_dir is None:
+        plot_dir = os.path.join(os.path.dirname(os.path.abspath(__file__)), "..", "data", "plots")
+    os.makedirs(plot_dir, exist_ok=True)
+
+    if param_sets is None:
+        sc1 = _phase_sigma_c(1.0, 1.0)   # I=1, alpha=1
+        sc2 = _phase_sigma_c(1.0, 2.0)   # I=1, alpha=2
+        sc05 = _phase_sigma_c(1.0, 0.5)  # I=1, alpha=0.5
+        param_sets = [
+            dict(I=1.0, alpha=1.0, beta=1.0, sigma=1.1 * sc1,
+                 label=r"$\sigma=1.1\sigma_c$, $\alpha=1$"),
+            dict(I=1.0, alpha=1.0, beta=1.0, sigma=1.5 * sc1,
+                 label=r"$\sigma=1.5\sigma_c$, $\alpha=1$"),
+            dict(I=1.0, alpha=1.0, beta=1.0, sigma=2.0 * sc1,
+                 label=r"$\sigma=2.0\sigma_c$, $\alpha=1$"),
+            dict(I=1.0, alpha=2.0, beta=1.0, sigma=1.5 * sc2,
+                 label=r"$\sigma=1.5\sigma_c$, $\alpha=2$"),
+            dict(I=1.0, alpha=0.5, beta=1.0, sigma=1.5 * sc05,
+                 label=r"$\sigma=1.5\sigma_c$, $\alpha=0.5$"),
+            dict(I=1.0, alpha=1.0, beta=0.5, sigma=1.5 * sc1,
+                 label=r"$\sigma=1.5\sigma_c$, $\beta=0.5$"),
+        ]
+
+    n = len(param_sets)
+    ncols = min(n, 3)
+    nrows = (n + ncols - 1) // ncols
+    fig, axes = plt.subplots(nrows, ncols, figsize=(5 * ncols, 4 * nrows))
+    axes_flat = np.array(axes).flatten()
+
+    for ax, ps in zip(axes_flat, param_sets):
+        I_ = ps["I"]; alpha_ = ps["alpha"]; beta_ = ps["beta"]; sigma_ = ps["sigma"]
+        label = ps.get("label", fr"$\sigma={sigma_:.2f}$")
+        sigma_c_ = _phase_sigma_c(I_, alpha_)
+        print(f"  {label}  (sigma/sigma_c={sigma_/sigma_c_:.2f})")
+
+        # Theory
+        try:
+            tau_th, C_th, _ = theory_phase_autocorr(
+                I=I_, alpha=alpha_, sigma=sigma_, beta=beta_,
+                tau_max=tau_max, dtau=dt,
+            )
+        except Exception as e:
+            print(f"  theory failed: {e}")
+            tau_th, C_th = None, None
+
+        # Simulation
+        C_runs = []
+        tau_s = None
+        for _ in range(max(1, sim_reps)):
+            tau_run, C_run = sim_phase_network(
+                N=N, I=I_, alpha=alpha_, sigma=sigma_, beta=beta_,
+                T=T, dt=dt, tau_max=tau_max, n_probe=N,
+            )
+            tau_s = tau_run
+            C_runs.append(C_run)
+        C_s = np.mean(C_runs, axis=0)
+
+        def norm(x):
+            x0 = float(x[0])
+            return x / x0 if abs(x0) > 1e-12 else x
+
+        ax.plot(tau_s, norm(C_s), "b", lw=1.5, alpha=0.85, label="Sim")
+        if C_th is not None:
+            ax.plot(tau_th, norm(C_th), "r--", lw=2, label="Theory")
+        ax.axhline(0, color="k", lw=0.5)
+        ax.set(
+            xlabel=r"$\tau$", ylabel=r"$C_{uu}/C_{uu}(0)$",
+            title=label, xlim=(0, tau_max),
+        )
+        ax.legend(fontsize=8)
+
+    for ax in axes_flat[n:]:
+        ax.set_visible(False)
+
+    plt.suptitle(
+        "Phase network: sim vs theory — parameter dependence",
+        fontsize=13, fontweight="bold",
+    )
+    plt.tight_layout()
+    outpath = os.path.join(plot_dir, "phase_corr_params.png")
+    plt.savefig(outpath, dpi=150)
+    print(f"Saved to {outpath}")
+    plt.close("all")
+
+
+# -----------------------------------------------------------------------------
+# 4. Sim vs theory: N convergence
+# -----------------------------------------------------------------------------
+
+def plot_phase_corr_N(
+    N_vals=None,
+    sigma=None,
+    I=1.0,
+    alpha=1.0,
+    beta=1.0,
+    T=5000.0,
+    dt=0.02,
+    tau_max=80.0,
+    plot_dir=None,
+):
+    """Sim vs theory C_uu(tau) for different N (finite-size convergence).
+
+    Three panels: subcritical / near-critical / chaotic regimes.
+    Each panel overlays all N values; theory shown when available.
+    """
+    import os
+    if plot_dir is None:
+        plot_dir = os.path.join(os.path.dirname(os.path.abspath(__file__)), "..", "data", "plots")
+    os.makedirs(plot_dir, exist_ok=True)
+
+    if N_vals is None:
+        N_vals = (64, 128, 256, 512, 1024)
+
+    sigma_c = _phase_sigma_c(I, alpha)
+
+    if sigma is None:
+        sigma_list = [1.1 * sigma_c, 1.5 * sigma_c, 3.0 * sigma_c]
+        regime_labels = [
+            fr"just above critical ($g=1.1$)",
+            fr"supercritical ($g=1.5$)",
+            fr"chaotic ($g=3.0$)",
+        ]
+    else:
+        sigma_list = [sigma]
+        regime_labels = [fr"$\sigma={sigma:.2f}$"]
+
+    ncols = len(sigma_list)
+    fig, axes = plt.subplots(1, ncols, figsize=(5 * ncols, 4))
+    if ncols == 1:
+        axes = [axes]
+
+    colors = plt.cm.viridis(np.linspace(0.1, 0.9, len(N_vals)))
+
+    for ax, sig, rlabel in zip(axes, sigma_list, regime_labels):
+        print(f"  N-convergence: sigma={sig:.2f} (g={sig/sigma_c:.2f})")
+
+        # Theory
+        try:
+            tau_th, C_th, _ = theory_phase_autocorr(
+                I=I, alpha=alpha, sigma=sig, beta=beta, tau_max=tau_max, dtau=dt,
+            )
+            C_th_n = C_th / C_th[0] if abs(float(C_th[0])) > 1e-12 else C_th
+            ax.plot(tau_th, C_th_n, "k--", lw=2.5, zorder=5, label="Theory")
+        except Exception as e:
+            print(f"  theory failed: {e}")
+
+        for N, color in zip(N_vals, colors):
+            print(f"    N={N}")
+            tau_s, C_s = sim_phase_network(
+                N=N, I=I, alpha=alpha, sigma=sig, beta=beta,
+                T=T, dt=dt, tau_max=tau_max, n_probe=N,
+            )
+            C_n = C_s / C_s[0] if abs(float(C_s[0])) > 1e-12 else C_s
+            ax.plot(tau_s, C_n, lw=1.3, color=color, alpha=0.85, label=f"N={N}")
+
+        ax.axhline(0, color="k", lw=0.5)
+        ax.set(
+            xlabel=r"$\tau$", ylabel=r"$C_{uu}/C_{uu}(0)$",
+            title=rlabel, xlim=(0, tau_max),
+        )
+        ax.legend(fontsize=8)
+
+    plt.suptitle(
+        fr"Phase network: finite-size convergence  ($I={I}$, $\alpha={alpha}$, $\sigma_c={sigma_c:.2f}$)",
+        fontsize=12, fontweight="bold",
+    )
+    plt.tight_layout()
+    outpath = os.path.join(plot_dir, "phase_corr_N.png")
+    plt.savefig(outpath, dpi=150)
+    print(f"Saved to {outpath}")
+    plt.close("all")
 
 
 # -----------------------------------------------------------------------------
@@ -1468,9 +1940,9 @@ def plot_binary_network_N_convergence(sigma=0.8, N_vals=(128, 300, 800, 1600),
 
 if __name__ == "__main__":
     import os
-    # Save plots in python/plots directory
+    # Save plots to data/plots directory
     script_dir = os.path.dirname(os.path.abspath(__file__))
-    plot_dir = os.path.join(script_dir, "..", "plots")
+    plot_dir = os.path.join(script_dir, "..", "data", "plots")
     os.makedirs(plot_dir, exist_ok=True)
     print(f"Saving plots to: {plot_dir}")
 

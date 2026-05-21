@@ -1,8 +1,17 @@
-name: randomnet-py
+name: randomnet
 channels:
   - conda-forge
+  - defaults
 dependencies:
   - python=3.11
+  - numpy
+  - scipy
+  - matplotlib
+  - jupyter
+  - ipython
+  - pip
+  - pip:
+    - networkx
   - pip
   - pip:
       - numpy

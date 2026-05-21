@@ -1,0 +1,32 @@
+[build-system]
+requires = ["setuptools>=45", "wheel", "setuptools_scm[toml]>=6.2"]
+build-backend = "setuptools.build_meta"
+
+[project]
+name = "randomnet"
+version = "0.1.0"
+description = "Phase-reset spiking and binary rate network simulations"
+authors = [
+    {name = "Carson C", email = ""}
+]
+license = {text = "MIT"}
+requires-python = ">=3.11"
+dependencies = [
+    "numpy",
+    "scipy",
+    "matplotlib",
+]
+
+[project.optional-dependencies]
+dev = [
+    "jupyter",
+    "ipython",
+    "pytest",
+]
+
+[tool.setuptools.packages.find]
+where = ["."]
+include = ["randomnet*"]
+
+[project.urls]
+Repository = "https://github.com/carsonc/RandomNet"

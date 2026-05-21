@@ -2,22 +2,56 @@
 
 Code to simulate and analyze randomly connected neural networks.
 
-## Repository layout
+## Repository Structure
 
-- `julia/`: primary Julia source files (`RandomNet.jl` and related modules)
-- `src/`: Julia package entrypoint shim for compatibility with Julia package loading
-- `Project.toml`, `Manifest.toml`: Julia environment and dependencies
-- `python/simulations/`: standalone Python simulation scripts for 2PI experiments
+```
+RandomNet/
+├── randomnet/              # Main Python package
+├── scripts/                # Simulation and analysis scripts
+│   ├── random_network.py   # Core simulation code
+│   └── make_quick_plots.py
+├── data/
+│   ├── plots/             # All visualization outputs
+│   └── results/           # Simulation results and cache
+├── tests/                 # Test and debugging scripts
+├── julia/                 # Julia implementation (reference)
+├── environment.yml        # Conda environment specification
+└── pyproject.toml         # Python package configuration
+```
 
-## Python simulations
+## Setup
 
-The script `python/simulations/random_network.py` runs the 2PI test simulations and plotting workflows.
+### Create Conda Environment
 
-Terminology note:
-- The continuous-state model `du_i/dt = -u_i + sum_j W_ij f(u_j)` is the
-	rate network.
-- A separate phase-neuron model is also implemented in
-	`python/simulations/random_network.py` (`sim_phase_network`,
+```bash
+conda env create -f environment.yml -p ./miniconda/envs/randomnet
+conda activate randomnet
+```
+
+Alternatively, if using existing miniconda installation:
+
+```bash
+~/miniconda/bin/conda env create -f environment.yml
+source ~/miniconda/etc/profile.d/conda.sh
+conda activate randomnet
+```
+
+## Running Simulations
+
+All simulation results and plots are saved to `data/plots/`:
+
+```bash
+cd scripts
+python random_network.py
+```
+
+## File Organization
+
+- **randomnet/**: Python package modules for network simulations
+- **scripts/**: Executable simulation and plotting scripts
+- **data/**: All numerical results and visualizations
+- **tests/**: Development and debugging scripts  
+- **julia/**: Reference Julia implementation (not actively maintained)
 	`theory_phase_autocorr`, `plot_phase_network`).
 
 ### Conda environment (recommended)
