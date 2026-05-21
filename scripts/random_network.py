@@ -35,9 +35,12 @@ def make_weights(N, sigma, lam=1, rng=rng):
     lam=0  -> plain Gaussian
     """
     W = rng.normal(0, sigma / np.sqrt(N), (N, N))
+    np.fill_diagonal(W, 0)          # zero diagonal first
     if lam:
-        W -= W.mean(axis=1, keepdims=True)
-    np.fill_diagonal(W, 0)
+        # Correct off-diagonal row sums to zero (N-1 terms per row)
+        row_sums = W.sum(axis=1, keepdims=True)
+        W -= row_sums / (N - 1)
+        np.fill_diagonal(W, 0)      # re-zero diagonal (it absorbed -correction)
     return W
 
 
@@ -171,11 +174,13 @@ def theory_rate_autocorr(
         if len(candidates) == 0:
             return float(initial_guess if initial_guess is not None else 0.65)
 
-        # Look for a sign change in the energy endpoint.
+        # Look for a NEGATIVE-to-POSITIVE sign change only.
+        # +→- crossings are numerical artifacts near C0=0 and must be ignored;
+        # the physical SCS fixed point is where H goes from negative to positive.
         for i in range(len(candidates) - 1):
-            if values[i] == 0:
+            if values[i] == 0 and values[i] < values[i + 1]:
                 return float(candidates[i])
-            if values[i] * values[i + 1] < 0:
+            if values[i] < 0 and values[i + 1] > 0:          # physical -→+ crossing
                 a, b = float(candidates[i]), float(candidates[i + 1])
                 fa, fb = float(values[i]), float(values[i + 1])
                 for _ in range(40):
@@ -191,8 +196,8 @@ def theory_rate_autocorr(
                         a, fa = m, fm
                 return float(0.5 * (a + b))
 
-        # Fallback: choose the candidate closest to the self-consistency root.
-        return float(candidates[np.argmin(np.abs(values))])
+        # No physical -→+ crossing found: no SCS fixed point exists.
+        return float(lo)
 
     def monotone_solution(C0_val):
         C0_val = float(C0_val)
@@ -357,21 +362,16 @@ def theory_phase_autocorr(
     n_quad=24,
 ):
     """
-    Correct 2PI/SCS: solve for C_11(tau) directly (not C_tilde).
+    Solve the 2PI SCS equation for the phase neuron network with lambda=1.
 
-    Self-consistent system:
-      C_eq = sigma^2 * mu_g(C_11_0)^2
-      sigma^2 * integral_{C_eq}^{C_11_0} Q_c(k; C_11_0) dk = (C_11_0^2 - C_eq^2)/2
+    With row-sum correction (lambda=1), W@1=0 so E[u_i]=0 exactly, meaning
+    C_11(tau->inf)=0 and C_eq=0. The centered SCS with gain g is directly correct:
+    no g_shifted or C_eq machinery needed.
 
-    where Q_c(k; C_11_0) = E[g(w1)*g(w2)] - mu_g(C_11_0)^2
-    for (w1,w2) ~ BivNorm(variance=C_11_0, covariance=k).
-
-    Monotone ODE: dC_11/dtau = -beta * sqrt(H(C_11)),
-      H(k) = k^2 - C_eq^2 - 2*sigma^2*integral_{C_eq}^{k} Q_c(k'; C_11_0) dk'
-    C_11 decays from C_11_0 at tau=0 to C_eq at tau=inf.
+    The beta parameter rescales time: tau_max and dtau are multiplied by beta
+    before the solver, then divided on return.
     """
     rho = 1.0 / (2.0 * np.pi)
-    beta_val = max(float(beta), 1e-10)
 
     def g(u):
         return rho * alpha * np.maximum(I + u, 0.0) ** (1.0 / alpha)
@@ -380,7 +380,6 @@ def theory_phase_autocorr(
     sigma_c = 1.0 / (rho * Fprime0)
 
     gh_x, gh_w = np.polynomial.hermite.hermgauss(n_quad)
-    gh_w2 = np.outer(gh_w, gh_w)
 
     def mu_g(C_val):
         """E[g(u)] for u ~ N(0, C_val) via 1-D GH quadrature."""
@@ -390,122 +389,52 @@ def theory_phase_autocorr(
         s = np.sqrt(2.0 * C_val)
         return float(np.sum(gh_w * g(s * gh_x)) / np.sqrt(np.pi))
 
-    def Q_centered(k, C_11_0):
-        """Cov(g(w1),g(w2)) for (w1,w2)~BivNorm(var=C_11_0, cov=k)."""
-        C_11_0 = float(C_11_0)
-        k = float(k)
-        if C_11_0 <= 0.0:
-            return 0.0
-        rho_c = float(np.clip(k / C_11_0, -0.999999, 0.999999))
-        scale = np.sqrt(2.0 * C_11_0)
-        # Bivariate GH: w1 = scale*xi, w2 = scale*(rho*xi + sqrt(1-rho^2)*xj)
-        xi = scale * gh_x[:, None]   # (n_quad, 1)
-        xj = scale * (rho_c * gh_x[:, None] + np.sqrt(max(1.0 - rho_c**2, 0.0)) * gh_x[None, :])
-        Q_raw = float(np.sum(gh_w2 * g(xi) * g(xj)) / np.pi)
-        return Q_raw - mu_g(C_11_0) ** 2
+    beta_val = max(float(beta), 1e-10)
+    # C0_bounds: upper limit must cover C_11(0) which for large sigma scales as
+    # sigma^4 / (16*pi^3) (from self-consistency of the shot-noise variance).
+    # Use a 10x safety factor; the formula underestimates at moderate sigma.
+    C0_hi = max(50.0, 10.0 * sigma ** 4 / (16.0 * np.pi ** 3))
 
-    def C_eq_of(C_11_0):
-        return sigma ** 2 * mu_g(float(C_11_0)) ** 2
+    tau_s, C = theory_rate_autocorr(
+        C0=C0,
+        sigma=sigma,
+        tau_max=tau_max * beta_val,
+        dtau=dtau * beta_val,
+        f=g,
+        n_quad=n_quad,
+        C0_bounds=(1e-4, C0_hi),
+        mu_f=mu_g,
+    )
 
-    def energy(C_11_0_val, n_grid=128):
-        """Energy = sigma^2 * int Q_c dk - (C_11_0^2 - C_eq^2)/2; zero at self-consistent solution."""
-        C_11_0_val = float(C_11_0_val)
-        C_eq_val = C_eq_of(C_11_0_val)
-        if C_11_0_val <= C_eq_val + 1e-14:
-            return 0.0
-        k_grid = np.linspace(C_eq_val, C_11_0_val, n_grid)
-        Q_grid = np.array([sigma ** 2 * Q_centered(k, C_11_0_val) for k in k_grid])
-        ie = float(np.trapezoid(Q_grid, k_grid))
-        return ie - (C_11_0_val ** 2 - C_eq_val ** 2) / 2.0
+    return tau_s / beta_val, C, sigma_c
 
-    # ── Step 1: rough C_eq from bisection on C = sigma^2 * mu_g(C)^2 ────────
-    C_eq_rough = 0.0
-    lo = 0.0
-    hi = max(1e-3, sigma ** 2 * float(g(0.0)) ** 2)
-    h_hi = hi - sigma ** 2 * mu_g(hi) ** 2
-    for _ in range(64):
-        if h_hi > 0:
-            break
-        lo = hi
-        hi *= 4.0
-        if hi > 1e8:
-            break
-        h_hi = hi - sigma ** 2 * mu_g(hi) ** 2
-    if h_hi > 0:
-        for _ in range(80):
-            mid = 0.5 * (lo + hi)
-            h_mid = mid - sigma ** 2 * mu_g(mid) ** 2
-            if abs(h_mid) < 1e-9 * max(1.0, abs(mid)):
-                C_eq_rough = mid
-                break
-            if h_mid < 0:
-                lo = mid
-            else:
-                hi = mid
-        C_eq_rough = 0.5 * (lo + hi)
 
-    # ── Step 2: find C_11_0 by bisecting energy(C_11_0) = 0 ─────────────────
-    # energy is positive near C_eq (subcritical) and negative at large C_11_0.
-    # The non-trivial root (if it exists) marks the chaotic fixed point.
-    C_11_0 = C_eq_rough   # default: no fluctuating part
-    lo2 = C_eq_rough + 1e-4
-    hi2 = max(lo2 * 2.0, C_eq_rough + 1.0)
-    if C0 is not None:
-        hi2 = max(hi2, float(C0) + C_eq_rough)
-    e_lo = energy(lo2)
-    e_hi = energy(hi2)
-    found_bracket = False
-    for _ in range(50):
-        if e_lo > 0.0 and e_hi < 0.0:
-            found_bracket = True
-            break
-        if e_lo <= 0.0:
-            lo2 = C_eq_rough + 1e-6
-            e_lo = energy(lo2)
-        hi2 *= 2.0
-        if hi2 > 1e7:
-            break
-        e_hi = energy(hi2)
-    if found_bracket:
-        for _ in range(60):
-            mid2 = 0.5 * (lo2 + hi2)
-            e_mid = energy(mid2)
-            if abs(e_mid) < 1e-7 * max(1.0, mid2 ** 2):
-                C_11_0 = mid2
-                break
-            if e_mid > 0.0:
-                lo2 = mid2
-            else:
-                hi2 = mid2
-        C_11_0 = 0.5 * (lo2 + hi2)
+def shot_noise_correction(tau, sigma, beta, I, alpha, C0_total, n_quad=24):
+    """
+    Return the shot-noise autocorrelation to subtract from C_uu^sim(tau).
 
-    C_eq_final = C_eq_of(C_11_0)
-    C_tilde_0 = C_11_0 - C_eq_final
+    When spikes are Poisson with rate g(u) = rho*F(u) and u is filtered
+    through an exponential kernel with rate beta, each spike contributes a
+    PSC h(s) = beta*W_ij*exp(-beta*s).  The resulting shot-noise covariance is
 
-    # ── Step 3: monotone solution C_11(tau) via arc-length integration ────────
-    ntau = max(1, int(tau_max / dtau))
-    tau_arr = np.arange(ntau) * dtau
+        C_shot(tau) = (sigma^2 * beta / 2) * E[g(u)] * exp(-beta * |tau|)
 
-    if C_tilde_0 < 1e-12:
-        return tau_arr, np.full(ntau, C_eq_final), sigma_c
+    where E[g(u)] is estimated from 1-D GH quadrature at variance C0_total
+    (the empirical total C_uu(0), which already includes both SCS and shot-noise
+    contributions, giving a self-consistent estimate of the mean firing rate).
+    """
+    rho = 1.0 / (2.0 * np.pi)
+    gh_x, gh_w = np.polynomial.hermite.hermgauss(n_quad)
 
-    n_grid = max(512, int(400 * max(C_tilde_0, 1.0)))
-    k_grid = np.linspace(C_eq_final, C_11_0, n_grid)
-    Q_grid = np.array([sigma ** 2 * Q_centered(k, C_11_0) for k in k_grid])
-    integral_Q = np.zeros(n_grid)
-    integral_Q[1:] = np.cumsum(0.5 * (Q_grid[1:] + Q_grid[:-1]) * np.diff(k_grid))
-    H_grid = np.maximum(k_grid ** 2 - C_eq_final ** 2 - 2.0 * integral_Q, 1e-16)
+    def g(u):
+        return rho * alpha * np.maximum(I + u, 0.0) ** (1.0 / alpha)
 
-    # Integrate dtau = dC / (beta * sqrt(H)) from C_11_0 downward to C_eq
-    k_desc = k_grid[::-1]
-    H_desc = H_grid[::-1]
-    speed = beta_val * np.sqrt(H_desc)
-    dC = np.abs(np.diff(k_desc))
-    seg_speed = 0.5 * (speed[:-1] + speed[1:])
-    tau_desc = np.concatenate([[0.0], np.cumsum(dC / np.maximum(seg_speed, 1e-16))])
+    C0 = float(max(C0_total, 1e-14))
+    s = np.sqrt(2.0 * C0)
+    mean_g = float(np.sum(gh_w * g(s * gh_x)) / np.sqrt(np.pi))
 
-    C_11 = np.interp(tau_arr, tau_desc, k_desc, left=C_11_0, right=C_eq_final)
-    return tau_arr, C_11, sigma_c
+    amplitude = 0.5 * sigma ** 2 * float(beta) * mean_g
+    return amplitude * np.exp(-float(beta) * np.abs(tau))
 
 
 def theory_phase_spike_autocorr(
@@ -710,8 +639,9 @@ def plot_phase_network(
         C_s = np.mean(C_runs, axis=0)
 
         ax.plot(tau_s, C_s, "b", lw=1.5, alpha=0.85, label=f"Sim ({sim_reps} runs)")
-        if C_th is not None:
-            ax.plot(tau_th, C_th, "r--", lw=2, label="2PI reduced")
+        # Only show theory where a valid SCS fixed point was found (C0 > threshold)
+        if C_th is not None and C_th[0] > 1e-2:
+            ax.plot(tau_th, C_th, "r--", lw=2, label="2PI theory")
         ax.axhline(0, color="k", lw=0.5)
         ax.set(
             xlabel=r"$\tau$",
@@ -1859,8 +1789,9 @@ def plot_phase_corr_params(
         C_s = np.mean(C_runs, axis=0)
 
         ax.plot(tau_s, C_s, "b", lw=1.5, alpha=0.85, label="Sim")
-        if C_th is not None:
-            ax.plot(tau_th, C_th, "r--", lw=2, label="Theory")
+        # Only show theory where a valid SCS fixed point was found (C0 > threshold)
+        if C_th is not None and C_th[0] > 1e-2:
+            ax.plot(tau_th, C_th, "r--", lw=2, label="2PI theory")
         ax.axhline(0, color="k", lw=0.5)
         ax.set(
             xlabel=r"$\tau$", ylabel=r"$C_{uu}(\tau)$",
@@ -1933,12 +1864,13 @@ def plot_phase_corr_N(
     for ax, sig, rlabel in zip(axes, sigma_list, regime_labels):
         print(f"  N-convergence: sigma={sig:.2f} (g={sig/sigma_c:.2f})")
 
-        # Theory
+        # Theory — only plot when a valid SCS fixed point was found
         try:
             tau_th, C_th, _ = theory_phase_autocorr(
                 I=I, alpha=alpha, sigma=sig, beta=beta, tau_max=tau_max, dtau=dt,
             )
-            ax.plot(tau_th, C_th, "k--", lw=2.5, zorder=5, label="Theory")
+            if C_th[0] > 1e-2:
+                ax.plot(tau_th, C_th, "k--", lw=2.5, zorder=5, label="Theory")
         except Exception as e:
             print(f"  theory failed: {e}")
 
