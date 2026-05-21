@@ -21,6 +21,7 @@ rng = np.random.default_rng(42)
 def autocorr(x, max_lag):
     """Unbiased autocorrelation via FFT, normalised so C(0)=variance."""
     n = len(x)
+    max_lag = min(max_lag, n - 1)  # Can't correlate beyond series length
     xc = x - x.mean()
     full = np.real(ifft(np.abs(fft(xc, n=2 * n)) ** 2))[:max_lag]
     nrm = n - np.arange(max_lag)  # unbiased normalisation
@@ -332,7 +333,7 @@ def sim_phase_network(
 
     max_lag = int(tau_max / dt)
     C = np.mean([autocorr(U_probe[:, i], max_lag) for i in range(n_probe)], axis=0)
-    tau = np.arange(max_lag) * dt
+    tau = np.arange(len(C)) * dt  # Use actual length of C
     if not return_spike:
         return tau, C
 

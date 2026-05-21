@@ -3,7 +3,7 @@
 import numpy as np
 import matplotlib.pyplot as plt
 from python.simulations.random_network import (
-    sim_phase_network, theory_phase_autocorr, autocorr
+    sim_phase_network, theory_phase_autocorr
 )
 
 # Two cases: below and near critical
@@ -14,10 +14,7 @@ for idx, sigma in enumerate([0.5*2*np.pi, 1.0*2*np.pi]):
     
     # Simulation
     np.random.seed(42)
-    C_sim = sim_phase_network(N=500, I=1.0, alpha=1.0, sigma=sigma, beta=1.0, T=30, dt=0.01, n_probe=1)
-    C_sim = C_sim[0] if isinstance(C_sim, (tuple, list)) else C_sim
-    C_sim = autocorr(C_sim, max_lag=1500)
-    tau_sim = np.arange(len(C_sim)) * 0.01
+    tau_sim, C_sim = sim_phase_network(N=500, I=1.0, alpha=1.0, sigma=sigma, beta=1.0, T=30, dt=0.01, n_probe=1)
     
     # Theory
     tau_th, C_th, sigma_c = theory_phase_autocorr(I=1.0, alpha=1.0, sigma=sigma, beta=1.0, tau_max=15, dtau=0.01)
