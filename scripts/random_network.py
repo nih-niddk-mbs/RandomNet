@@ -342,8 +342,10 @@ def sim_phase_network(
             R_pop[t] = np.mean(spikes.astype(float)) / dt
 
     max_lag = int(tau_max / dt)
+    # Average per-neuron autocorrelation: matches C_SCS(tau) at long lags (tau >> 1/beta)
+    # where shot noise has decayed. At tau~0 includes shot noise contribution.
     C = np.mean([autocorr(U_probe[:, i], max_lag) for i in range(n_probe)], axis=0)
-    tau = np.arange(len(C)) * dt  # Use actual length of C
+    tau = np.arange(len(C)) * dt
     if not return_spike:
         return tau, C
 
@@ -406,7 +408,32 @@ def theory_phase_autocorr(
         mu_f=mu_g,
     )
 
-    return tau_s / beta_val, C, sigma_c
+    # --- Shot noise correction (2PI, Sec. 4.1) ---
+    # Point-process spikes carry an intrinsic shot-noise term in their two-time
+    # correlation: Q(t,s) = Q_SCS(t,s) + D_shot * delta(t-s), where
+    #   D_shot = sigma^2 * rho * <F(u)>.
+    # Filtering through the exponential synaptic kernel h(tau)=beta*exp(-beta*tau)
+    # converts this to an additive contribution to C_11(tau):
+    #   C_shot(tau) = (beta/2) * D_shot * exp(-beta*|tau|)
+    # <F(u)> (and hence D_shot) must be evaluated self-consistently at the TOTAL
+    # C_11(0) = C_SCS(0) + C_shot(0), because u is driven by the full spike train.
+    tau_out = tau_s / beta_val
+    C0_SCS = float(C[0])
+    C0_total = C0_SCS  # initial guess; iterate to fixed point
+    for _ in range(60):
+        C_shot_0 = float(
+            shot_noise_correction(
+                np.array([0.0]), sigma, beta_val, I, alpha, C0_total, n_quad
+            )[0]
+        )
+        C0_new = C0_SCS + C_shot_0
+        if abs(C0_new - C0_total) < 1e-10 * max(1.0, C0_total):
+            break
+        C0_total = 0.5 * (C0_total + C0_new)  # damped fixed-point update
+    C_shot = shot_noise_correction(tau_out, sigma, beta_val, I, alpha, C0_total, n_quad)
+    C = C + C_shot
+
+    return tau_out, C, sigma_c
 
 
 def shot_noise_correction(tau, sigma, beta, I, alpha, C0_total, n_quad=24):
@@ -638,14 +665,22 @@ def plot_phase_network(
             C_runs.append(C_run)
         C_s = np.mean(C_runs, axis=0)
 
-        ax.plot(tau_s, C_s, "b", lw=1.5, alpha=0.85, label=f"Sim ({sim_reps} runs)")
-        # Only show theory where a valid SCS fixed point was found (C0 > threshold)
-        if C_th is not None and C_th[0] > 1e-2:
-            ax.plot(tau_th, C_th, "r--", lw=2, label="2PI theory")
+        C_s_norm = C_s / C_s[0] if C_s[0] > 0 else C_s
+        has_theory = C_th is not None and C_th[0] > 1e-2
+        if has_theory:
+            # Recover the SCS-only curve: C_SCS = C_full - C_shot
+            # (shot noise was evaluated self-consistently at C_th[0])
+            C_shot_th = shot_noise_correction(tau_th, sigma, beta, I, alpha, C_th[0])
+            C_SCS_norm = (C_th - C_shot_th) / C_th[0]
+            C_th_norm = C_th / C_th[0]
+            ax.plot(tau_th, C_SCS_norm, color="orange", lw=1.5, ls=":", label="SCS only", zorder=2)
+            ax.plot(tau_th, C_th_norm, "r--", lw=2, label="SCS+shot noise", zorder=3)
+        ax.plot(tau_s, C_s_norm, "b", lw=1.5, alpha=0.85, label=f"Sim ({sim_reps} runs)", zorder=2)
         ax.axhline(0, color="k", lw=0.5)
         ax.set(
             xlabel=r"$\tau$",
-            ylabel=r"$C_{uu}(\tau)$",
+            ylabel=r"$C_{uu}(\tau) / C_{uu}(0)$",
+            ylim=(-0.2, 1.05),
             title=fr"$\sigma={sigma:.2f}$, $g={g_val:.2f}$",
             xlim=(0, tau_max),
         )
@@ -1788,13 +1823,19 @@ def plot_phase_corr_params(
             C_runs.append(C_run)
         C_s = np.mean(C_runs, axis=0)
 
-        ax.plot(tau_s, C_s, "b", lw=1.5, alpha=0.85, label="Sim")
-        # Only show theory where a valid SCS fixed point was found (C0 > threshold)
-        if C_th is not None and C_th[0] > 1e-2:
-            ax.plot(tau_th, C_th, "r--", lw=2, label="2PI theory")
+        C_s_norm = C_s / C_s[0] if C_s[0] > 0 else C_s
+        has_theory = C_th is not None and C_th[0] > 1e-2
+        if has_theory:
+            C_shot_th = shot_noise_correction(tau_th, sigma_, beta_, I_, alpha_, C_th[0])
+            C_SCS_norm = (C_th - C_shot_th) / C_th[0]
+            C_th_norm = C_th / C_th[0]
+            ax.plot(tau_th, C_SCS_norm, color="orange", lw=1.5, ls=":", label="SCS only", zorder=2)
+            ax.plot(tau_th, C_th_norm, "r--", lw=2, label="SCS+shot noise", zorder=3)
+        ax.plot(tau_s, C_s_norm, "b", lw=1.5, alpha=0.85, label="Sim", zorder=2)
         ax.axhline(0, color="k", lw=0.5)
         ax.set(
-            xlabel=r"$\tau$", ylabel=r"$C_{uu}(\tau)$",
+            xlabel=r"$\tau$", ylabel=r"$C_{uu}(\tau) / C_{uu}(0)$",
+            ylim=(-0.2, 1.05),
             title=label, xlim=(0, tau_max),
         )
         ax.legend(fontsize=8)
@@ -1870,7 +1911,11 @@ def plot_phase_corr_N(
                 I=I, alpha=alpha, sigma=sig, beta=beta, tau_max=tau_max, dtau=dt,
             )
             if C_th[0] > 1e-2:
-                ax.plot(tau_th, C_th, "k--", lw=2.5, zorder=5, label="Theory")
+                C_shot_th = shot_noise_correction(tau_th, sig, beta, I, alpha, C_th[0])
+                C_SCS_norm = (C_th - C_shot_th) / C_th[0]
+                C_th_norm = C_th / C_th[0]
+                ax.plot(tau_th, C_SCS_norm, color="orange", lw=1.5, ls=":", zorder=5, label="SCS only")
+                ax.plot(tau_th, C_th_norm, "k--", lw=2.5, zorder=6, label="SCS+shot noise")
         except Exception as e:
             print(f"  theory failed: {e}")
 
@@ -1880,11 +1925,13 @@ def plot_phase_corr_N(
                 N=N, I=I, alpha=alpha, sigma=sig, beta=beta,
                 T=T, dt=dt, tau_max=tau_max, n_probe=N,
             )
-            ax.plot(tau_s, C_s, lw=1.3, color=color, alpha=0.85, label=f"N={N}")
+            C_s_norm = C_s / C_s[0] if C_s[0] > 0 else C_s
+            ax.plot(tau_s, C_s_norm, lw=1.3, color=color, alpha=0.85, label=f"N={N}")
 
         ax.axhline(0, color="k", lw=0.5)
         ax.set(
-            xlabel=r"$\tau$", ylabel=r"$C_{uu}(\tau)$",
+            xlabel=r"$\tau$", ylabel=r"$C_{uu}(\tau) / C_{uu}(0)$",
+            ylim=(-0.2, 1.05),
             title=rlabel, xlim=(0, tau_max),
         )
         ax.legend(fontsize=8)
