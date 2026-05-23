@@ -1,0 +1,2039 @@
+"""Phase/spiking-network simulations, theory closures, and plots."""
+
+import os
+
+import numpy as np
+import matplotlib.pyplot as plt
+
+from rn_core import autocorr, make_weights, rng
+
+# -----------------------------------------------------------------------------
+# 1b. PHASE NEURON NETWORK
+#     phi_i in [-pi, pi], dphi_i/dt = alpha * max(I + u_i, 0)^(1/alpha)
+#     spikes when phi_i crosses pi; u_i is driven by spike input through W.
+# -----------------------------------------------------------------------------
+
+def sim_phase_network(
+    N=512,
+    I=1.0,
+    alpha=1.0,
+    sigma=7.0,
+    beta=1.0,
+    T=3000.0,
+    dt=0.02,
+    lam=1,
+    burn=300,
+    tau_max=50.0,
+    n_probe=None,
+    return_spike=False,
+    return_u=False,
+    rng=rng,
+):
+    """Simulate a phase-reset network and return C_uu(tau).
+
+    If return_spike is True, also return C_spk(tau) estimated from the
+    whole-network population spike-rate time series r(t)=N_spk(t)/(N*dt).
+    This is much smoother than averaging per-neuron sparse spike trains.
+    """
+    W = make_weights(N, sigma, lam, rng)
+    phi = rng.uniform(-np.pi, np.pi, N)
+    u = np.zeros(N)
+
+    def F(u_):
+        return alpha * np.clip(I + u_, 0.0, 1e12) ** (1.0 / alpha)
+
+    nb = int(burn / dt)
+    for _ in range(nb):
+        phi += F(u) * dt
+        spike_counts = np.floor((phi + np.pi) / (2.0 * np.pi)).astype(float)
+        spikes = spike_counts > 0
+        # Correct multi-spike: wrap phi into (-pi, pi) regardless of how many
+        # cycles were completed in this step (F(u)*dt can exceed 2*pi for large u).
+        phi[spikes] = ((phi[spikes] + np.pi) % (2.0 * np.pi)) - np.pi
+        with np.errstate(over="ignore", divide="ignore", invalid="ignore"):
+            drive = W @ spike_counts
+        u += -beta * u * dt + beta * drive
+        if not np.all(np.isfinite(u)):
+            u = np.nan_to_num(u, nan=0.0, posinf=1e6, neginf=-1e6)
+
+    nt = int(T / dt)
+    if n_probe is None:
+        n_probe = N
+    n_probe = int(max(1, min(N, n_probe)))
+    probe_idx = np.arange(n_probe)
+    U_probe = np.zeros((nt, n_probe))
+    R_pop = np.zeros(nt, dtype=float) if return_spike else None
+    for t in range(nt):
+        phi += F(u) * dt
+        spike_counts = np.floor((phi + np.pi) / (2.0 * np.pi)).astype(float)
+        spikes = spike_counts > 0
+        phi[spikes] = ((phi[spikes] + np.pi) % (2.0 * np.pi)) - np.pi
+        with np.errstate(over="ignore", divide="ignore", invalid="ignore"):
+            drive = W @ spike_counts
+        u += -beta * u * dt + beta * drive
+        if not np.all(np.isfinite(u)):
+            u = np.nan_to_num(u, nan=0.0, posinf=1e6, neginf=-1e6)
+        U_probe[t] = u[probe_idx]
+        if return_spike:
+            R_pop[t] = np.mean(spike_counts) / dt
+
+    max_lag = int(tau_max / dt)
+    # Average per-neuron autocorrelation: matches C_SCS(tau) at long lags (tau >> 1/beta)
+    # where shot noise has decayed. At tau~0 includes shot noise contribution.
+    C = np.mean([autocorr(U_probe[:, i], max_lag) for i in range(n_probe)], axis=0)
+    tau = np.arange(len(C)) * dt
+    if not return_spike and not return_u:
+        return tau, C
+
+    out = [tau, C]
+    if return_spike:
+        C_spk = autocorr(R_pop, max_lag)
+        out.append(C_spk)
+    if return_u:
+        out.append(U_probe)
+    return tuple(out)
+
+
+def theory_phase_autocorr(
+    I=1.0,
+    alpha=1.0,
+    sigma=7.0,
+    beta=1.0,
+    C0=None,
+    tau_max=50,
+    dtau=0.01,
+    n_quad=24,
+    solver="fd",
+    kernel_omega=0.0,
+    kernel_damping=0.0,
+    kernel_scaled_by_beta=True,
+    fd_max_nfev=250,
+    fd_tail_weight=10.0,
+    fd_kick_weight=5.0,
+    q_method="gh",
+    n_qmc=2048,
+    hermite_order=32,
+    cov_penalty_weight=5.0,
+    warn_on_no_branch=True,
+):
+    """
+    Solve the 2PI SCS equation for the phase neuron network with lambda=1,
+    including the point-process shot-noise kick at tau=0.
+
+    With row-sum correction (lambda=1), W@1=0 so E[u_i]=0 exactly, meaning
+    C_11(tau->inf)=0 and C_eq=0. The centered SCS with gain g is directly correct:
+    no g_shifted or C_eq machinery needed.
+
+    The shot noise enters Q as D_shot delta(tau), which gives the initial
+    velocity C'(0+) = -beta^2 D_shot/2.  The smooth tau>0 trajectory is then
+    selected by the modified energy condition
+
+        H(C0) = C0^2 - 2 int_0^C0 Q_smooth(C; C0) dC = beta^2 D_shot(C0)^2 / 4.
+
+    solver="energy" uses the monotone conserved-energy branch and is valid only
+    for the rate-like SCS operator.  solver="fd" solves the second-order equation
+    directly on a finite-difference grid with the shot-noise derivative kick and
+    quiet-tail boundary residuals.  solver="inflated_ic" tests the alternative
+    interpretation where the filtered shot-noise variance only inflates C(0) and
+    the smooth ODE is integrated with C'(0)=0.
+
+    The finite-difference solver can test a minimal generalized phase kernel,
+
+        L_C C = C'' + 2*kernel_damping*C'
+                + (kernel_omega**2 - beta**2)*C,
+
+    so the tau>0 equation is
+
+        L_C C = -beta**2 * Q_smooth(C; C0).
+
+    kernel_omega=kernel_damping=0 recovers the rate-like SCS reduction.  By
+    default the generalized-kernel parameters are dimensionless multiples of
+    beta, so kernel_omega=2 means omega=2*beta and kernel_damping=1 means
+    damping=beta.  Set kernel_scaled_by_beta=False to pass raw time units.
+    The fd_* weights are numerical continuation controls for the boundary
+    residuals; oscillatory kernels usually need stronger tail weighting than the
+    monotone SCS branch.
+    q_method="gh" uses tensor Gauss-Hermite quadrature for Q_smooth. q_method="qmc"
+    uses common-random Sobol Gaussian samples, which is slower but more robust
+    for hard rectification and strongly nonlinear gains. q_method="hermite" uses
+    a 1-D Hermite expansion of g(u) and evaluates the centered covariance as a
+    series in C(tau)/C(0), avoiding cancellation from subtracting E[g]^2.
+    warn_on_no_branch controls whether alpha<1 branch failures are printed; scans
+    turn this off to avoid repetitive console noise.
+    """
+    rho = 1.0 / (2.0 * np.pi)
+
+    def g(u):
+        return rho * alpha * np.clip(I + u, 0.0, 1e12) ** (1.0 / alpha)
+
+    Fprime0 = float(np.maximum(I, 1e-10) ** (1.0 / alpha - 1.0))
+    sigma_c = 1.0 / (rho * Fprime0)
+
+    gh_x, gh_w = np.polynomial.hermite.hermgauss(n_quad)
+    gh_w2 = np.outer(gh_w, gh_w)
+    q_method = str(q_method).lower()
+    use_hermite_series = q_method in ("hermite", "hermite-series", "series")
+    if q_method in ("sobol", "qmc", "mc"):
+        try:
+            from scipy.special import ndtri
+            from scipy.stats import qmc
+
+            sampler = qmc.Sobol(d=2, scramble=True, seed=12345)
+            m = int(np.ceil(np.log2(max(16, int(n_qmc)))))
+            u_sobol = sampler.random_base2(m)
+            eps = np.finfo(float).eps
+            z_qmc = ndtri(np.clip(u_sobol, eps, 1.0 - eps))
+        except Exception:
+            q_rng = np.random.default_rng(12345)
+            z_qmc = q_rng.normal(size=(max(16, int(n_qmc)), 2))
+        z0_qmc = z_qmc[:, 0]
+        z1_qmc = z_qmc[:, 1]
+    else:
+        z0_qmc = z1_qmc = None
+    hermite_cache = {}
+
+    def hermite_coeffs(C0_val):
+        """
+        Return normalized Hermite coefficients b_n=E[g(sZ) phi_n(Z)].
+
+        phi_n(Z)=He_n(Z)/sqrt(n!) are orthonormal under Z~N(0,1).  The
+        centered covariance is sum_{n>=1} b_n^2 rho^n, so the mean mode b_0 is
+        intentionally omitted by Q_centered.
+        """
+        C0_val = float(C0_val)
+        key = round(C0_val, 12)
+        if key in hermite_cache:
+            return hermite_cache[key]
+
+        z = np.sqrt(2.0) * gh_x
+        vals = g(np.sqrt(max(C0_val, 0.0)) * z)
+        w = gh_w / np.sqrt(np.pi)
+        order = int(max(1, hermite_order))
+        coeffs = np.zeros(order + 1)
+
+        phi_nm1 = np.ones_like(z)
+        coeffs[0] = float(np.dot(w, vals * phi_nm1))
+        if order >= 1:
+            phi_n = z
+            coeffs[1] = float(np.dot(w, vals * phi_n))
+            for n in range(1, order):
+                phi_np1 = (z * phi_n - np.sqrt(n) * phi_nm1) / np.sqrt(n + 1.0)
+                coeffs[n + 1] = float(np.dot(w, vals * phi_np1))
+                phi_nm1, phi_n = phi_n, phi_np1
+
+        # Avoid unbounded cache growth during finite-difference least_squares.
+        if len(hermite_cache) > 2048:
+            hermite_cache.clear()
+        hermite_cache[key] = coeffs
+        return coeffs
+
+    def mu_g(C_val):
+        """E[g(u)] for u ~ N(0, C_val) via 1-D GH quadrature."""
+        C_val = float(C_val)
+        if C_val <= 0.0:
+            return float(g(0.0))
+        if z0_qmc is not None:
+            return float(np.mean(g(np.sqrt(C_val) * z0_qmc)))
+        s = np.sqrt(2.0 * C_val)
+        return float(np.sum(gh_w * g(s * gh_x)) / np.sqrt(np.pi))
+
+    def Q_centered(C_tau, C0_val):
+        """sigma^2 * Cov[g(u(0)), g(u(tau))] for a Gaussian pair."""
+        C0_val = float(C0_val)
+        if C0_val <= 0.0:
+            return 0.0
+        rho_tau = float(np.clip(C_tau / C0_val, -0.999999, 0.999999))
+        if use_hermite_series:
+            coeffs = hermite_coeffs(C0_val)
+            powers = rho_tau ** np.arange(1, len(coeffs))
+            return sigma**2 * float(np.dot(coeffs[1:] ** 2, powers))
+        if z0_qmc is not None:
+            s = np.sqrt(C0_val)
+            x = s * z0_qmc
+            y = s * (rho_tau * z0_qmc + np.sqrt(1.0 - rho_tau**2) * z1_qmc)
+            gx = g(x)
+            gy = g(y)
+            return sigma**2 * float(np.mean(gx * gy) - np.mean(gx) * np.mean(gy))
+        scale = np.sqrt(2.0 * C0_val)
+        x = scale * gh_x[:, None]
+        y = scale * (
+            rho_tau * gh_x[:, None] + np.sqrt(1.0 - rho_tau**2) * gh_x[None, :]
+        )
+        raw = float(np.sum(gh_w2 * g(x) * g(y)) / np.pi)
+        mu = mu_g(C0_val)
+        return sigma**2 * (raw - mu**2)
+
+    def D_shot(C0_val):
+        """D_shot = sigma^2 * rho * <F(u)> = sigma^2 * <g(u)>."""
+        return sigma**2 * mu_g(C0_val)
+
+    beta_val = max(float(beta), 1e-10)
+    kernel_scale = beta_val if kernel_scaled_by_beta else 1.0
+    omega_val = float(kernel_omega) * kernel_scale
+    damping_val = float(kernel_damping) * kernel_scale
+    C0_hi = max(50.0, 10.0 * sigma ** 4 / (16.0 * np.pi ** 3))
+
+    def energy_balance(C0_val, n_grid=384):
+        C0_val = float(C0_val)
+        if C0_val <= 0.0:
+            return np.nan
+        C_grid = np.linspace(0.0, C0_val, n_grid)
+        Q_grid = np.array([Q_centered(c, C0_val) for c in C_grid])
+        integral_Q = np.trapezoid(Q_grid, C_grid)
+        H0 = C0_val**2 - 2.0 * integral_Q
+        target = 0.25 * beta_val**2 * D_shot(C0_val) ** 2
+        return float(H0 - target)
+
+    def smooth_energy(C_val, C0_val, n_grid=384):
+        """H(C; C0) = C^2 - 2 int_0^C Q_smooth(x; C0) dx."""
+        C_val = float(C_val)
+        C0_val = float(C0_val)
+        if C_val <= 0.0 or C0_val <= 0.0:
+            return np.nan
+        C_grid = np.linspace(0.0, C_val, n_grid)
+        Q_grid = np.array([Q_centered(c, C0_val) for c in C_grid])
+        return float(C_val**2 - 2.0 * np.trapezoid(Q_grid, C_grid))
+
+    def solve_c0():
+        if C0 is not None:
+            guess_val = float(C0)
+            if guess_val > 0.0:
+                return guess_val
+
+        lo, hi = 1e-5, C0_hi
+        linear = np.linspace(lo, min(hi, 10.0), 80)
+        log = np.logspace(np.log10(lo), np.log10(hi), 80)
+        candidates = np.unique(np.sort(np.concatenate([linear, log])))
+        values = np.array([energy_balance(c) for c in candidates])
+        finite = np.isfinite(values)
+        candidates, values = candidates[finite], values[finite]
+        if len(candidates) == 0:
+            return 1e-4
+
+        # Prefer the first negative-to-positive crossing; it is the monotone
+        # branch continuously connected to the transition.
+        for i in range(len(candidates) - 1):
+            if values[i] <= 0.0 and values[i + 1] >= 0.0:
+                a, b = float(candidates[i]), float(candidates[i + 1])
+                fa = float(values[i])
+                for _ in range(60):
+                    m = 0.5 * (a + b)
+                    fm = energy_balance(m)
+                    if not np.isfinite(fm) or abs(fm) < 1e-10:
+                        return float(m)
+                    if fa * fm <= 0.0:
+                        b = m
+                    else:
+                        a, fa = m, fm
+                return float(0.5 * (a + b))
+
+        # Superlinear gains can genuinely lose the finite stationary branch.
+        # Returning the closest tiny value is misleading: it looks like a theory
+        # curve but is really the failed zero-amplitude fallback.
+        if alpha < 1.0:
+            if warn_on_no_branch:
+                print(
+                    "  no finite phase-theory amplitude found for alpha<1; "
+                    "Gaussian closure likely has no stationary branch here"
+                )
+            return np.nan
+
+        # If no bracket appears, choose the closest balance point so plotting can
+        # still reveal the mismatch instead of failing hard for benign regimes.
+        return float(candidates[np.argmin(np.abs(values))])
+
+    ntau = int(tau_max / dtau)
+    tau = np.arange(ntau) * dtau
+
+    solver_key = str(solver).lower()
+    C0_val = None if solver_key in ("inflated_ic", "inflated-ic", "inflated") else solve_c0()
+
+    def energy_solution(C0_val):
+        n_grid = max(768, int(350 * max(C0_val, 1.0)))
+        C_grid = np.linspace(0.0, C0_val, n_grid)
+        Q_grid = np.array([Q_centered(c, C0_val) for c in C_grid])
+        integral_Q = np.zeros_like(C_grid)
+        integral_Q[1:] = np.cumsum(
+            0.5 * (Q_grid[1:] + Q_grid[:-1]) * np.diff(C_grid)
+        )
+
+        # The shot-noise kick determines C0 through H(C0)=beta^2 D_shot^2/4.
+        # For tau>0 the conserved-energy branch is still dC/dtau=-beta*sqrt(H(C));
+        # no extra constant is added under the square root.
+        H_grid = np.maximum(C_grid**2 - 2.0 * integral_Q, 1e-14)
+        C_desc = C_grid[::-1]
+        speed = beta_val * np.sqrt(H_grid[::-1])
+        dC = -np.diff(C_desc)
+        seg_speed = 0.5 * (speed[:-1] + speed[1:])
+        tau_desc = np.concatenate(
+            [[0.0], np.cumsum(dC / np.maximum(seg_speed, 1e-14))]
+        )
+        return np.interp(tau, tau_desc, C_desc, left=C0_val, right=0.0)
+
+    def finite_difference_solution(C0_seed):
+        from scipy.optimize import least_squares
+
+        n_fd = int(min(max(ntau, 64), 700))
+        tau_fd = np.linspace(0.0, float(tau[-1] if len(tau) else tau_max), n_fd)
+        h = float(tau_fd[1] - tau_fd[0]) if n_fd > 1 else float(dtau)
+        C_init = np.interp(tau_fd, tau, energy_solution(C0_seed))
+
+        lower = np.full(n_fd, -C0_hi)
+        upper = np.full(n_fd, C0_hi)
+        lower[0] = 1e-8
+
+        def residual(C_vec):
+            C_vec = np.asarray(C_vec, dtype=float)
+            C0_fd = float(max(C_vec[0], 1e-8))
+            Q_vals = np.array([Q_centered(c, C0_fd) for c in C_vec])
+
+            # Interior second-order finite-difference equation:
+            # L_C C = -beta^2 Q_smooth(C; C0), with
+            # L_C = d^2 + 2*damping*d + (omega^2-beta^2).
+            first_deriv = (C_vec[2:] - C_vec[:-2]) / (2.0 * h)
+            interior = (
+                (C_vec[2:] - 2.0 * C_vec[1:-1] + C_vec[:-2]) / h**2
+                + 2.0 * damping_val * first_deriv
+                + (omega_val**2 - beta_val**2) * C_vec[1:-1]
+                + beta_val**2 * Q_vals[1:-1]
+            )
+
+            # One-sided derivative kick at tau=0.
+            left_deriv = (-3.0 * C_vec[0] + 4.0 * C_vec[1] - C_vec[2]) / (2.0 * h)
+            left_bc = left_deriv + 0.5 * beta_val**2 * D_shot(C0_fd)
+
+            # Quiet-tail residuals approximate C(tau->inf)=C'(tau->inf)=0.
+            right_deriv = (3.0 * C_vec[-1] - 4.0 * C_vec[-2] + C_vec[-3]) / (2.0 * h)
+            scale = max(abs(C0_fd), 1.0)
+            cov_violation = np.maximum(np.abs(C_vec[1:]) - C0_fd, 0.0)
+            return np.concatenate(
+                [
+                    interior / scale,
+                    cov_penalty_weight * cov_violation / scale,
+                    np.array(
+                        [
+                            fd_kick_weight * left_bc / (beta_val * scale),
+                            fd_tail_weight * C_vec[-1] / scale,
+                            fd_tail_weight * right_deriv / (beta_val * scale),
+                        ]
+                    ),
+                ]
+            )
+
+        fit = least_squares(
+            residual,
+            C_init,
+            bounds=(lower, upper),
+            loss="soft_l1",
+            f_scale=0.1,
+            max_nfev=int(fd_max_nfev),
+            xtol=1e-5,
+            ftol=1e-5,
+            gtol=1e-5,
+        )
+        if not fit.success:
+            print(f"  finite-difference phase theory did not fully converge: {fit.message}")
+        return np.interp(tau, tau_fd, fit.x)
+
+    def solve_inflated_total_c0():
+        if C0 is not None:
+            guess_val = float(C0)
+            if guess_val > 0.0:
+                return guess_val
+
+        def balance(C_total):
+            C_total = float(C_total)
+            C_smooth0 = C_total - 0.5 * beta_val * D_shot(C_total)
+            if C_total <= 0.0 or C_smooth0 <= 0.0:
+                return np.nan
+            return smooth_energy(C_smooth0, C_total)
+
+        lo, hi = 1e-5, C0_hi
+        linear = np.linspace(lo, min(hi, 10.0), 80)
+        log = np.logspace(np.log10(lo), np.log10(hi), 80)
+        candidates = np.unique(np.sort(np.concatenate([linear, log])))
+        values = np.array([balance(c) for c in candidates])
+        finite = np.isfinite(values)
+        candidates, values = candidates[finite], values[finite]
+        if len(candidates) == 0:
+            return solve_c0()
+
+        for i in range(len(candidates) - 1):
+            if values[i] == 0.0:
+                return float(candidates[i])
+            if values[i] * values[i + 1] < 0.0:
+                a, b = float(candidates[i]), float(candidates[i + 1])
+                fa = float(values[i])
+                for _ in range(60):
+                    m = 0.5 * (a + b)
+                    fm = balance(m)
+                    if not np.isfinite(fm) or abs(fm) < 1e-10:
+                        return float(m)
+                    if fa * fm <= 0.0:
+                        b = m
+                    else:
+                        a, fa = m, fm
+                return float(0.5 * (a + b))
+        if alpha < 1.0:
+            if warn_on_no_branch:
+                print(
+                    "  no finite inflated-IC branch found for alpha<1; "
+                    "not plotting a spurious near-zero theory curve"
+                )
+            return np.nan
+        return float(candidates[np.argmin(np.abs(values))])
+
+    def inflated_ic_solution():
+        from scipy.integrate import solve_ivp
+
+        C_total0 = solve_inflated_total_c0()
+        if not np.isfinite(C_total0):
+            return np.full_like(tau, np.nan, dtype=float)
+
+        def rhs(_, y):
+            c, cp = float(y[0]), float(y[1])
+            q = Q_centered(c, C_total0)
+            cpp = (
+                -2.0 * damping_val * cp
+                - (omega_val**2 - beta_val**2) * c
+                - beta_val**2 * q
+            )
+            return [cp, cpp]
+
+        sol = solve_ivp(
+            rhs,
+            (0.0, float(tau[-1] if len(tau) else tau_max)),
+            [C_total0, 0.0],
+            t_eval=tau,
+            method="DOP853",
+            rtol=1e-6,
+            atol=1e-8,
+        )
+        if not sol.success:
+            print(f"  inflated-IC phase theory did not fully converge: {sol.message}")
+        return sol.y[0] if sol.y.shape[1] == len(tau) else np.interp(tau, sol.t, sol.y[0])
+
+    if solver_key in ("energy", "monotone"):
+        if not np.isfinite(C0_val):
+            return tau, np.full_like(tau, np.nan, dtype=float), sigma_c
+        if abs(omega_val) > 0.0 or abs(damping_val) > 0.0:
+            raise ValueError("solver='energy' is only valid for kernel_omega=kernel_damping=0")
+        C = energy_solution(C0_val)
+    elif solver_key in ("fd", "finite_difference", "finite-difference"):
+        if not np.isfinite(C0_val):
+            return tau, np.full_like(tau, np.nan, dtype=float), sigma_c
+        C = finite_difference_solution(C0_val)
+    elif solver_key in ("inflated_ic", "inflated-ic", "inflated"):
+        C = inflated_ic_solution()
+    else:
+        raise ValueError("solver must be 'fd', 'energy', or 'inflated_ic'")
+
+    return tau, C, sigma_c
+
+
+def shot_noise_correction(tau, sigma, beta, I, alpha, C0_total, n_quad=24):
+    """
+    Return the shot-noise autocorrelation to subtract from C_uu^sim(tau).
+
+    When spikes are Poisson with rate g(u) = rho*F(u) and u is filtered
+    through an exponential kernel with rate beta, each spike contributes a
+    PSC h(s) = beta*W_ij*exp(-beta*s).  The resulting shot-noise covariance is
+
+        C_shot(tau) = (sigma^2 * beta / 2) * E[g(u)] * exp(-beta * |tau|)
+
+    where E[g(u)] is estimated from 1-D GH quadrature at variance C0_total
+    (the empirical total C_uu(0), which already includes both SCS and shot-noise
+    contributions, giving a self-consistent estimate of the mean firing rate).
+    """
+    rho = 1.0 / (2.0 * np.pi)
+    gh_x, gh_w = np.polynomial.hermite.hermgauss(n_quad)
+
+    def g(u):
+        return rho * alpha * np.clip(I + u, 0.0, 1e12) ** (1.0 / alpha)
+
+    C0 = float(max(C0_total, 1e-14))
+    s = np.sqrt(2.0 * C0)
+    mean_g = float(np.sum(gh_w * g(s * gh_x)) / np.sqrt(np.pi))
+
+    amplitude = 0.5 * sigma ** 2 * float(beta) * mean_g
+    return amplitude * np.exp(-float(beta) * np.abs(tau))
+
+
+def phase_gaussian_gain_covariance(C_tau, C0, I=1.0, alpha=1.0, sigma=1.0,
+                                   n_quad=32, q_method="gh", n_qmc=4096,
+                                   hermite_order=32):
+    """Gaussian closure for sigma^2 * Cov[g(u0), g(utau)] with g=rho*F."""
+    rho_phase = 1.0 / (2.0 * np.pi)
+
+    def g(u):
+        return rho_phase * alpha * np.clip(I + u, 0.0, 1e12) ** (1.0 / alpha)
+
+    C0 = float(C0)
+    if C0 <= 0.0:
+        return 0.0
+    r = float(np.clip(C_tau / C0, -0.999999, 0.999999))
+    if str(q_method).lower() in ("hermite", "hermite-series", "series"):
+        gh_x, gh_w = np.polynomial.hermite.hermgauss(n_quad)
+        z = np.sqrt(2.0) * gh_x
+        vals = g(np.sqrt(C0) * z)
+        w = gh_w / np.sqrt(np.pi)
+        order = int(max(1, hermite_order))
+        coeffs = np.zeros(order + 1)
+        phi_nm1 = np.ones_like(z)
+        coeffs[0] = float(np.dot(w, vals * phi_nm1))
+        if order >= 1:
+            phi_n = z
+            coeffs[1] = float(np.dot(w, vals * phi_n))
+            for n in range(1, order):
+                phi_np1 = (z * phi_n - np.sqrt(n) * phi_nm1) / np.sqrt(n + 1.0)
+                coeffs[n + 1] = float(np.dot(w, vals * phi_np1))
+                phi_nm1, phi_n = phi_n, phi_np1
+        powers = r ** np.arange(1, len(coeffs))
+        return sigma**2 * float(np.dot(coeffs[1:] ** 2, powers))
+
+    if str(q_method).lower() in ("qmc", "sobol", "mc"):
+        try:
+            from scipy.special import ndtri
+            from scipy.stats import qmc
+
+            sampler = qmc.Sobol(d=2, scramble=True, seed=12345)
+            m = int(np.ceil(np.log2(max(16, int(n_qmc)))))
+            uu = sampler.random_base2(m)
+            eps = np.finfo(float).eps
+            z = ndtri(np.clip(uu, eps, 1.0 - eps))
+        except Exception:
+            z = np.random.default_rng(12345).normal(size=(max(16, int(n_qmc)), 2))
+        x = np.sqrt(C0) * z[:, 0]
+        y = np.sqrt(C0) * (r * z[:, 0] + np.sqrt(1.0 - r**2) * z[:, 1])
+        gx = g(x)
+        gy = g(y)
+        return sigma**2 * float(np.mean(gx * gy) - np.mean(gx) * np.mean(gy))
+
+    gh_x, gh_w = np.polynomial.hermite.hermgauss(n_quad)
+    gh_w2 = np.outer(gh_w, gh_w)
+    scale = np.sqrt(2.0 * C0)
+    x = scale * gh_x[:, None]
+    y = scale * (r * gh_x[:, None] + np.sqrt(1.0 - r**2) * gh_x[None, :])
+    raw = float(np.sum(gh_w2 * g(x) * g(y)) / np.pi)
+    mu = float(np.sum(gh_w * g(scale * gh_x)) / np.sqrt(np.pi))
+    return sigma**2 * (raw - mu**2)
+
+
+def plot_phase_nonlinear_closure_diagnostic(
+    examples=None,
+    N=512,
+    T=1200.0,
+    dt=0.02,
+    burn=300.0,
+    tau_max=20.0,
+    n_probe=128,
+    plot_dir=None,
+    q_method="qmc",
+):
+    """Compare empirical nonlinear gain covariance to the Gaussian Q(C) closure."""
+    import os
+
+    if plot_dir is None:
+        plot_dir = os.path.join(os.path.dirname(os.path.abspath(__file__)), "..", "data", "plots")
+    os.makedirs(plot_dir, exist_ok=True)
+
+    if examples is None:
+        examples = []
+        for alpha_val in (0.5, 1.0, 2.0):
+            sc = _phase_sigma_c(1.0, alpha_val)
+            examples.append(dict(I=1.0, alpha=alpha_val, beta=1.0, sigma=1.3 * sc,
+                                 label=fr"$\alpha={alpha_val},\ g=1.3$"))
+
+    n = len(examples)
+    fig, axes = plt.subplots(1, n, figsize=(5.2 * n, 4.2))
+    if n == 1:
+        axes = [axes]
+
+    max_lag = int(tau_max / dt)
+
+    for ax, ex in zip(axes, examples):
+        I = ex.get("I", 1.0)
+        alpha = ex.get("alpha", 1.0)
+        beta = ex.get("beta", 1.0)
+        sigma = ex["sigma"]
+        label = ex.get("label", fr"$\alpha={alpha}$")
+        print(f"  nonlinear closure diagnostic {label}: sigma={sigma:.3f}")
+
+        tau, Cuu, U = sim_phase_network(
+            N=N, I=I, alpha=alpha, sigma=sigma, beta=beta,
+            T=T, dt=dt, burn=burn, tau_max=tau_max, n_probe=n_probe,
+            return_u=True,
+        )
+
+        rho_phase = 1.0 / (2.0 * np.pi)
+        G = rho_phase * alpha * np.clip(I + U, 0.0, 1e12) ** (1.0 / alpha)
+        Cg = np.mean([autocorr(G[:, i], max_lag) for i in range(G.shape[1])], axis=0)
+
+        C0 = float(max(Cuu[0], 1e-12))
+        C_grid = np.linspace(min(Cuu[:max_lag].min(), -0.2 * C0), C0, 160)
+        Q_gauss = np.array([
+            phase_gaussian_gain_covariance(
+                c, C0, I=I, alpha=alpha, sigma=sigma, q_method=q_method
+            )
+            for c in C_grid
+        ])
+        q_norm = max(abs(Q_gauss[-1]), 1e-12)
+
+        ax.plot(C_grid / C0, Q_gauss / q_norm, "k--", lw=2, label="Gaussian closure")
+        ax.plot(Cuu[:max_lag] / C0, sigma**2 * Cg[:max_lag] / q_norm,
+                color="C0", lw=1.7, label="Empirical sim")
+        ax.scatter(Cuu[:max_lag:25] / C0, sigma**2 * Cg[:max_lag:25] / q_norm,
+                   s=14, color="C0", alpha=0.6)
+
+        u_flat = U.reshape(-1)
+        std = np.std(u_flat)
+        z = (u_flat - np.mean(u_flat)) / max(std, 1e-12)
+        skew = np.mean(z**3)
+        kurt = np.mean(z**4) - 3.0
+        ax.set(
+            xlabel=r"$C_{uu}(\tau)/C_{uu}(0)$",
+            ylabel=r"$Q_{\rm smooth}/Q_{\rm smooth}(0)$",
+            title=label + "\n" + fr"skew={skew:.2f}, excess kurt={kurt:.2f}",
+        )
+        ax.legend(fontsize=8)
+        ax.axhline(0, color="0.7", lw=0.7)
+        ax.axvline(0, color="0.7", lw=0.7)
+
+    plt.suptitle("Nonlinear gain covariance: empirical vs Gaussian closure", fontsize=13, fontweight="bold")
+    plt.tight_layout()
+    outpath = os.path.join(plot_dir, "phase_nonlinear_closure_diagnostic.png")
+    plt.savefig(outpath, dpi=150)
+    print(f"Saved to {outpath}")
+    plt.close("all")
+
+
+def phase_shot_fixed_point_map(C_vals, I=1.0, alpha=1.0, sigma=7.0, beta=1.0,
+                               n_quad=64):
+    """Return shot-noise-only variance contribution beta*D_shot(C)/2."""
+    rho_phase = 1.0 / (2.0 * np.pi)
+    gh_x, gh_w = np.polynomial.hermite.hermgauss(n_quad)
+    C_vals = np.asarray(C_vals, dtype=float)
+    out = np.zeros_like(C_vals)
+    for idx, C in np.ndenumerate(C_vals):
+        C = float(max(C, 0.0))
+        if C <= 0.0:
+            mean_F = alpha * max(I, 0.0) ** (1.0 / alpha)
+        else:
+            u = np.sqrt(2.0 * C) * gh_x
+            F = alpha * np.clip(I + u, 0.0, 1e12) ** (1.0 / alpha)
+            mean_F = float(np.dot(gh_w, F) / np.sqrt(np.pi))
+        D_shot = sigma**2 * rho_phase * mean_F
+        out[idx] = 0.5 * beta * D_shot
+    return out
+
+
+def plot_phase_shot_fixed_point_diagnostic(
+    I=1.0,
+    beta=1.0,
+    alpha_vals=(0.5, 1.0, 2.0, 3.0),
+    g_vals=(0.8, 1.0, 1.2, 1.5),
+    C_min=0.1,
+    C_max=80.0,
+    n_C=400,
+    plot_dir=None,
+):
+    """Visualize when shot-noise self-consistency ceases to be contractive.
+
+    Plots S(C)/C where S(C)=beta*D_shot(C)/2.  The ratio diverges trivially at
+    tiny C when baseline firing is nonzero, so the plot starts at C_min and
+    clips the y-axis to focus on large-variance contractivity.
+    """
+    import os
+
+    if plot_dir is None:
+        plot_dir = os.path.join(os.path.dirname(os.path.abspath(__file__)), "..", "data", "plots")
+    os.makedirs(plot_dir, exist_ok=True)
+
+    C_vals = np.linspace(C_min, C_max, n_C)
+    n = len(alpha_vals)
+    ncols = min(2, n)
+    nrows = (n + ncols - 1) // ncols
+    fig, axes = plt.subplots(nrows, ncols, figsize=(6.2 * ncols, 4.4 * nrows))
+    axes_flat = np.array(axes).reshape(-1)
+
+    for ax, alpha in zip(axes_flat, alpha_vals):
+        sigma_c = _phase_sigma_c(I, alpha)
+        for g_val in g_vals:
+            sigma = g_val * sigma_c
+            S = phase_shot_fixed_point_map(
+                C_vals, I=I, alpha=alpha, sigma=sigma, beta=beta,
+            )
+            ratio = S / C_vals
+            ax.plot(C_vals, ratio, lw=1.8,
+                    label=fr"$g={g_val:g}$, tail={ratio[-1]:.2f}")
+
+        if alpha < 1.0:
+            category = "superlinear: separate regime"
+        elif alpha == 1.0:
+            category = "linear-growth boundary"
+        else:
+            category = "sublinear"
+        ax.axhline(1.0, color="k", ls=":", lw=1.2)
+        ax.set(
+            xlabel=r"$C_{11}(0)$",
+            ylabel=r"$[\beta D_{\rm shot}(C)/2]/C$",
+            title=fr"$\alpha={alpha:g}$  ({category})",
+            xlim=(C_min, C_max),
+            ylim=(0, 2.5),
+        )
+        ax.legend(fontsize=8)
+
+    for ax in axes_flat[n:]:
+        ax.set_visible(False)
+
+    plt.suptitle("Phase shot-noise self-consistency diagnostic", fontsize=13, fontweight="bold")
+    plt.tight_layout()
+    outpath = os.path.join(plot_dir, "phase_shot_fixed_point_diagnostic.png")
+    plt.savefig(outpath, dpi=150)
+    print(f"Saved to {outpath}")
+    plt.close("all")
+
+
+def phase_branch_exists(
+    sigma,
+    I=1.0,
+    alpha=1.0,
+    beta=1.0,
+    theory_kwargs=None,
+):
+    """Return (exists, C0) for the operational finite-branch criterion."""
+    kwargs = {} if theory_kwargs is None else dict(theory_kwargs)
+    kwargs.setdefault("solver", "inflated_ic")
+    kwargs.setdefault("q_method", "hermite")
+    kwargs.setdefault("n_quad", 48)
+    kwargs.setdefault("hermite_order", 32)
+    kwargs.setdefault("kernel_omega", 2.0)
+    kwargs.setdefault("kernel_damping", 1.0)
+    kwargs.setdefault("tau_max", 1.0)
+    kwargs.setdefault("dtau", 0.1)
+    kwargs.setdefault("warn_on_no_branch", False)
+    try:
+        _tau, C, _sigma_smooth = theory_phase_autocorr(
+            I=I,
+            alpha=alpha,
+            sigma=float(sigma),
+            beta=beta,
+            **kwargs,
+        )
+    except Exception:
+        return False, np.nan
+    if len(C) == 0 or not np.isfinite(C[0]) or C[0] <= 1e-10:
+        return False, np.nan
+    return True, float(C[0])
+
+
+def phase_operational_criticality(
+    I=1.0,
+    alpha=1.0,
+    beta=1.0,
+    g_bounds=(0.05, 2.0),
+    n_scan=40,
+    tol=1e-3,
+    theory_kwargs=None,
+):
+    """
+    Estimate the branch-existence criticality for the chosen closure.
+
+    Returns a dict with:
+      sigma_smooth : analytic smooth-feedback threshold
+      sigma_branch : largest sigma with a finite stationary branch
+      g_branch     : sigma_branch / sigma_smooth
+
+    This is an operational threshold, not a universal bifurcation theorem.  It
+    depends on the selected approximation in theory_kwargs.
+    """
+    sigma_smooth = _phase_sigma_c(I, alpha)
+    g_lo, g_hi = map(float, g_bounds)
+    g_grid = np.linspace(g_lo, g_hi, int(max(3, n_scan)))
+    exists = []
+    C0_vals = []
+    for g_val in g_grid:
+        ok, C0 = phase_branch_exists(
+            g_val * sigma_smooth,
+            I=I,
+            alpha=alpha,
+            beta=beta,
+            theory_kwargs=theory_kwargs,
+        )
+        exists.append(ok)
+        C0_vals.append(C0)
+
+    exists = np.asarray(exists, dtype=bool)
+    C0_vals = np.asarray(C0_vals, dtype=float)
+    if not np.any(exists):
+        return dict(
+            sigma_smooth=sigma_smooth,
+            sigma_branch=np.nan,
+            g_branch=np.nan,
+            g_grid=g_grid,
+            exists=exists,
+            C0=C0_vals,
+        )
+
+    last_ok_idx = int(np.where(exists)[0][-1])
+    if last_ok_idx == len(g_grid) - 1:
+        g_branch = float(g_grid[-1])
+        branch_censored = True
+    else:
+        branch_censored = False
+        lo = float(g_grid[last_ok_idx])
+        hi = float(g_grid[last_ok_idx + 1])
+        for _ in range(32):
+            mid = 0.5 * (lo + hi)
+            ok, _ = phase_branch_exists(
+                mid * sigma_smooth,
+                I=I,
+                alpha=alpha,
+                beta=beta,
+                theory_kwargs=theory_kwargs,
+            )
+            if ok:
+                lo = mid
+            else:
+                hi = mid
+            if hi - lo < tol:
+                break
+        g_branch = lo
+
+    return dict(
+        sigma_smooth=sigma_smooth,
+        sigma_branch=g_branch * sigma_smooth,
+        g_branch=g_branch,
+        branch_censored=branch_censored,
+        g_grid=g_grid,
+        exists=exists,
+        C0=C0_vals,
+    )
+
+
+def plot_phase_operational_criticality(
+    I=1.0,
+    beta=1.0,
+    alpha_vals=(0.5, 0.75, 1.0, 1.5, 2.0, 3.0),
+    g_bounds=(0.05, 2.0),
+    n_scan=36,
+    theory_kwargs=None,
+    plot_dir=None,
+):
+    """Plot smooth vs branch-existence criticality for the phase closure."""
+    import os
+
+    if plot_dir is None:
+        plot_dir = os.path.join(os.path.dirname(os.path.abspath(__file__)), "..", "data", "plots")
+    os.makedirs(plot_dir, exist_ok=True)
+
+    rows = []
+    for alpha in alpha_vals:
+        print(f"  estimating operational criticality for alpha={alpha:g}")
+        res = phase_operational_criticality(
+            I=I,
+            alpha=alpha,
+            beta=beta,
+            g_bounds=g_bounds,
+            n_scan=n_scan,
+            theory_kwargs=theory_kwargs,
+        )
+        rows.append((alpha, res))
+        print(
+            f"    sigma_smooth={res['sigma_smooth']:.4g}, "
+            f"sigma_branch={res['sigma_branch']:.4g}, "
+            f"g_branch={res['g_branch']:.4g}"
+        )
+
+    alphas = np.array([r[0] for r in rows], dtype=float)
+    sigma_smooth = np.array([r[1]["sigma_smooth"] for r in rows], dtype=float)
+    sigma_branch = np.array([r[1]["sigma_branch"] for r in rows], dtype=float)
+    g_branch = np.array([r[1]["g_branch"] for r in rows], dtype=float)
+    censored = np.array([r[1].get("branch_censored", False) for r in rows], dtype=bool)
+
+    fig, axes = plt.subplots(1, 2, figsize=(11.5, 4.2))
+    axes[0].plot(alphas, sigma_smooth, "ko-", lw=1.8, label=r"smooth $\sigma_c$")
+    axes[0].plot(alphas[~censored], sigma_branch[~censored], "ro-", lw=1.8, label=r"branch $\sigma_\ast$")
+    if np.any(censored):
+        axes[0].plot(alphas[censored], sigma_branch[censored], "r^", ms=8,
+                     label=r"branch $\sigma_\ast$ lower bound")
+    axes[0].set(xlabel=r"$\alpha$", ylabel=r"critical $\sigma$")
+    axes[0].legend()
+    axes[0].grid(alpha=0.25)
+
+    axes[1].plot(alphas[~censored], g_branch[~censored], "bo-", lw=1.8)
+    if np.any(censored):
+        axes[1].plot(alphas[censored], g_branch[censored], "b^", ms=8)
+    axes[1].axhline(1.0, color="k", ls=":", lw=1.2)
+    axes[1].set(
+        xlabel=r"$\alpha$",
+        ylabel=r"$g_\ast=\sigma_\ast/\sigma_c^{\rm smooth}$",
+        ylim=(0, max(1.2, np.nanmax(g_branch) * 1.15 if np.any(np.isfinite(g_branch)) else 1.2)),
+    )
+    axes[1].grid(alpha=0.25)
+
+    plt.suptitle("Phase operational criticality: finite stationary branch", fontsize=13, fontweight="bold")
+    plt.tight_layout()
+    outpath = os.path.join(plot_dir, "phase_operational_criticality.png")
+    plt.savefig(outpath, dpi=150)
+    print(f"Saved to {outpath}")
+    plt.close("all")
+    return rows
+
+
+def theory_phase_spike_autocorr(
+    I=1.0,
+    alpha=1.0,
+    sigma=7.0,
+    beta=1.0,
+    C_uu=None,
+    tau_max=50,
+    dtau=0.01,
+    n_quad=24,
+):
+    """
+    Phase-model spike autocorrelation from the phi-rate closure.
+
+    Uses
+        C_spk(tau) = rho^2 * E[F(u(0)) F(u(tau))], rho = 1/(2*pi),
+    where (u(0), u(tau)) is Gaussian with covariance from C_uu.
+    """
+    rho = 1.0 / (2.0 * np.pi)
+
+    def F(u):
+        return alpha * np.clip(I + u, 0.0, 1e12) ** (1.0 / alpha)
+
+    if C_uu is None:
+        tau, C_uu, sigma_c = theory_phase_autocorr(
+            I=I,
+            alpha=alpha,
+            sigma=sigma,
+            beta=beta,
+            tau_max=tau_max,
+            dtau=dtau,
+            n_quad=n_quad,
+        )
+    else:
+        tau = np.arange(len(C_uu)) * dtau
+        Fprime0 = float(np.maximum(I, 1e-10) ** (1.0 / alpha - 1.0))
+        sigma_c = 1.0 / (rho * Fprime0)
+
+    C0 = float(C_uu[0]) if len(C_uu) > 0 else 0.0
+    if C0 <= 0:
+        return tau, np.zeros_like(tau), sigma_c
+
+    gh_x, gh_w = np.polynomial.hermite.hermgauss(n_quad)
+    gh_w2 = np.outer(gh_w, gh_w)
+    scale = np.sqrt(2.0 * C0)
+
+    def pair_expectation(C_tau):
+        rho_tau = float(np.clip(C_tau / C0, -0.999999, 0.999999))
+        x = scale * gh_x[:, None]
+        y = scale * (
+            rho_tau * gh_x[:, None] + np.sqrt(1.0 - rho_tau**2) * gh_x[None, :]
+        )
+        return float(np.sum(gh_w2 * F(x) * F(y)) / np.pi)
+
+    C_spk_raw = rho**2 * np.array([pair_expectation(c_tau) for c_tau in C_uu])
+
+    # Centered correlation: Cov[r(0), r(tau)] = E[r0 r_tau] - E[r]^2.
+    u_1d = scale * gh_x
+    mean_rate = rho * float(np.dot(gh_w, F(u_1d)) / np.sqrt(np.pi))
+    C_spk = C_spk_raw - mean_rate**2
+    return tau, C_spk, sigma_c
+
+
+def plot_phase_spike_correlation(
+    I=1.0,
+    alpha=1.0,
+    beta=1.0,
+    sigma=None,
+    N=512,
+    T=8000.0,
+    dt=0.02,
+    dtau=0.02,
+    tau_max=120.0,
+    plot_dir=None,
+):
+    """Compare phase-model spike autocorrelation from simulation and theory."""
+    import os
+    if plot_dir is None:
+        plot_dir = os.path.join(os.path.dirname(os.path.abspath(__file__)), "..", "data", "plots")
+    os.makedirs(plot_dir, exist_ok=True)
+    _, _, sigma_c = theory_phase_autocorr(
+        I=I,
+        alpha=alpha,
+        sigma=1.0,
+        beta=beta,
+        tau_max=5,
+        dtau=dtau,
+    )
+    if sigma is None:
+        sigma = 0.6 * sigma_c
+
+    tau_s, _Cuu_s, Cspk_s = sim_phase_network(
+        N=N,
+        I=I,
+        alpha=alpha,
+        sigma=sigma,
+        beta=beta,
+        T=T,
+        dt=dt,
+        tau_max=tau_max,
+        return_spike=True,
+    )
+    tau_t, Cspk_t, _ = theory_phase_spike_autocorr(
+        I=I,
+        alpha=alpha,
+        sigma=sigma,
+        beta=beta,
+        tau_max=max(float(tau_s[-1]), tau_max, 1.0),
+        dtau=dtau,
+    )
+
+    # Remove the zero-lag bin to avoid the finite-dt point-process spike peak.
+    tau_s_plot, Cspk_s_plot = tau_s[1:], Cspk_s[1:]
+    tau_t_plot, Cspk_t_plot = tau_t[1:], Cspk_t[1:]
+
+    def norm(x):
+        x0 = float(x[0]) if len(x) > 0 else 1.0
+        return x / x0 if abs(x0) > 1e-12 else x
+
+    fig, ax = plt.subplots(figsize=(7, 4.5))
+    ax.plot(tau_s_plot, norm(Cspk_s_plot), lw=1.8, label="Simulation")
+    ax.plot(tau_t_plot, norm(Cspk_t_plot), "--", lw=2.2, label="Theory (phi-rate)")
+    ax.set_xlabel(r"$\tau$")
+    ax.set_ylabel(r"$C_{spk}(\tau) / C_{spk}(0^+)$")
+    ax.set_title(
+        f"Phase spike correlation: sigma={sigma:.2f} (sigma_c={sigma_c:.2f})"
+    )
+    ax.set_xlim(0, 120)
+    ax.legend()
+    fig.tight_layout()
+    import os
+    os.makedirs(plot_dir, exist_ok=True)
+    plt.savefig(os.path.join(plot_dir, "phase_spike_correlation_test.png"), dpi=150)
+    print(f"Saved to {os.path.join(plot_dir, 'phase_spike_correlation_test.png')}")
+    plt.close("all")
+
+
+def plot_phase_network(
+    I=1.0,
+    alpha=1.0,
+    beta=1.0,
+    N=512,
+    sigma_vals=None,
+    T=8000.0,
+    dt=0.02,
+    dtau=0.02,
+    tau_max=120.0,
+    sim_reps=3,
+    plot_dir=None,
+    theory_kwargs=None,
+):
+    """Compare phase-network simulation and reduced-theory autocorrelations."""
+    import os
+    if plot_dir is None:
+        plot_dir = os.path.join(os.path.dirname(os.path.abspath(__file__)), "..", "data", "plots")
+    os.makedirs(plot_dir, exist_ok=True)
+    rho = 1.0 / (2.0 * np.pi)
+    Fprime0 = float(np.maximum(I, 1e-10) ** (1.0 / alpha - 1.0))
+    sigma_c = 1.0 / (rho * Fprime0)
+    print(f"Phase model: I={I}, alpha={alpha}, sigma_c={sigma_c:.3f}")
+    theory_kwargs = {} if theory_kwargs is None else dict(theory_kwargs)
+    omega_label = float(theory_kwargs.get("kernel_omega", 0.0))
+    damping_label = float(theory_kwargs.get("kernel_damping", 0.0))
+    scaled_label = bool(theory_kwargs.get("kernel_scaled_by_beta", True))
+    solver_label = str(theory_kwargs.get("solver", "fd"))
+    theory_label = "2PI shot-kick"
+    if solver_label.lower() in ("inflated_ic", "inflated-ic", "inflated"):
+        theory_label = "2PI inflated IC"
+    if abs(omega_label) > 0.0 or abs(damping_label) > 0.0:
+        suffix = r"\times\beta" if scaled_label else ""
+        theory_label = fr"{theory_label} ($\omega={omega_label:g}{suffix}$, $\gamma={damping_label:g}{suffix}$)"
+
+    if sigma_vals is None:
+        sigma_vals = [0.75 * sigma_c, 0.95 * sigma_c, 1.1 * sigma_c]
+
+    fig, axes = plt.subplots(1, len(sigma_vals), figsize=(5 * len(sigma_vals), 4))
+    if len(sigma_vals) == 1:
+        axes = [axes]
+
+    for ax, sigma in zip(axes, sigma_vals):
+        g_val = sigma / sigma_c
+        print(f"\n-- phase sigma={sigma:.3f} (g={g_val:.2f}) --")
+
+        try:
+            tau_th, C_th, _ = theory_phase_autocorr(
+                I=I,
+                alpha=alpha,
+                sigma=sigma,
+                beta=beta,
+                tau_max=tau_max,
+                dtau=dtau,
+                **theory_kwargs,
+            )
+        except Exception as e:
+            print(f"  theory failed: {e}")
+            tau_th, C_th = None, None
+
+        C_runs = []
+        tau_s = None
+        for _ in range(max(1, int(sim_reps))):
+            tau_run, C_run = sim_phase_network(
+                N=N,
+                I=I,
+                alpha=alpha,
+                sigma=sigma,
+                beta=beta,
+                T=T,
+                dt=dt,
+                tau_max=tau_max,
+                n_probe=N,
+            )
+            tau_s = tau_run
+            C_runs.append(C_run)
+        C_s = np.mean(C_runs, axis=0)
+
+        C_s_norm = C_s / C_s[0] if C_s[0] > 0 else C_s
+        has_theory = C_th is not None and C_th[0] > 1e-2
+        if has_theory:
+            C_th_norm = C_th / C_th[0]
+            ax.plot(tau_th, C_th_norm, "r--", lw=2, label=theory_label, zorder=3)
+        ax.plot(tau_s, C_s_norm, "b", lw=1.5, alpha=0.85, label=f"Sim ({sim_reps} runs)", zorder=2)
+        ax.axhline(0, color="k", lw=0.5)
+        ax.set(
+            xlabel=r"$\tau$",
+            ylabel=r"$C_{uu}(\tau) / C_{uu}(0)$",
+            ylim=(-0.2, 1.05),
+            title=fr"$\sigma={sigma:.2f}$, $g={g_val:.2f}$",
+            xlim=(0, tau_max),
+        )
+        ax.legend(fontsize=8)
+
+    plt.suptitle(
+        fr"Phase neuron network: $I={I}$, $\alpha={alpha}$, $\sigma_c={sigma_c:.2f}$",
+        fontsize=13,
+        fontweight="bold",
+    )
+    import os
+    os.makedirs(plot_dir, exist_ok=True)
+    plt.tight_layout()
+    plt.savefig(os.path.join(plot_dir, "phase_network_test.png"), dpi=150)
+    print(f"Saved to {os.path.join(plot_dir, 'phase_network_test.png')}")
+    plt.close("all")
+
+
+def plot_phase_theory_comparison(
+    I=1.0,
+    alpha=1.0,
+    beta=1.0,
+    sigma=None,
+    N=256,
+    T=900.0,
+    dt=0.02,
+    dtau=0.1,
+    tau_max=35.0,
+    sim_reps=2,
+    plot_dir=None,
+    theory_variants=None,
+):
+    """Overlay simulation with several approximate phase-network theories."""
+    import os
+
+    if plot_dir is None:
+        plot_dir = os.path.join(os.path.dirname(os.path.abspath(__file__)), "..", "data", "plots")
+    os.makedirs(plot_dir, exist_ok=True)
+
+    sigma_c = _phase_sigma_c(I, alpha)
+    if sigma is None:
+        sigma = 1.3 * sigma_c
+
+    if theory_variants is None:
+        theory_variants = [
+            dict(
+                label="shot-kick FD",
+                kwargs=dict(solver="fd", n_quad=10, fd_max_nfev=140),
+                style=dict(color="C3", ls="--", lw=2.0),
+            ),
+            dict(
+                label=r"gen. kernel FD ($\omega=2,\gamma=1$)",
+                kwargs=dict(
+                    solver="fd", kernel_omega=2.0, kernel_damping=1.0,
+                    n_quad=10, fd_max_nfev=140,
+                ),
+                style=dict(color="C1", ls="-.", lw=2.0),
+            ),
+            dict(
+                label="inflated IC",
+                kwargs=dict(solver="inflated_ic", n_quad=10),
+                style=dict(color="C2", ls=":", lw=2.2),
+            ),
+            dict(
+                label=r"inflated IC + gen. kernel",
+                kwargs=dict(
+                    solver="inflated_ic", kernel_omega=2.0, kernel_damping=1.0,
+                    n_quad=10,
+                ),
+                style=dict(color="C4", ls=(0, (5, 2)), lw=2.0),
+            ),
+        ]
+
+    C_runs = []
+    tau_s = None
+    for _ in range(max(1, int(sim_reps))):
+        tau_run, C_run = sim_phase_network(
+            N=N, I=I, alpha=alpha, sigma=sigma, beta=beta,
+            T=T, dt=dt, tau_max=tau_max, n_probe=N,
+        )
+        tau_s = tau_run
+        C_runs.append(C_run)
+    C_s = np.mean(C_runs, axis=0)
+    C_s_norm = C_s / C_s[0] if C_s[0] > 0 else C_s
+
+    fig, ax = plt.subplots(figsize=(8, 4.8))
+    ax.plot(tau_s, C_s_norm, color="C0", lw=1.8, label=f"Sim ({sim_reps} runs)")
+
+    for variant in theory_variants:
+        kwargs = dict(variant.get("kwargs", {}))
+        style = dict(variant.get("style", {}))
+        label = variant.get("label", kwargs.get("solver", "theory"))
+        try:
+            tau_th, C_th, _ = theory_phase_autocorr(
+                I=I, alpha=alpha, sigma=sigma, beta=beta,
+                tau_max=tau_max, dtau=dtau, **kwargs,
+            )
+            norm = max(abs(C_th[0]), 1e-12)
+            ax.plot(tau_th, C_th / norm, label=label, **style)
+        except Exception as err:
+            print(f"  theory variant failed ({label}): {err}")
+
+    ax.axhline(0, color="k", lw=0.5)
+    ax.set(
+        xlabel=r"$\tau$",
+        ylabel=r"$C_{uu}(\tau) / C_{uu}(0)$",
+        title=fr"Phase theory comparison: $\sigma={sigma:.2f}$, $g={sigma/sigma_c:.2f}$",
+        xlim=(0, tau_max),
+        ylim=(-0.35, 1.1),
+    )
+    ax.legend(fontsize=8)
+    plt.tight_layout()
+    outpath = os.path.join(plot_dir, "phase_theory_comparison.png")
+    plt.savefig(outpath, dpi=150)
+    print(f"Saved to {outpath}")
+    plt.close("all")
+
+
+def plot_phase_theory_examples(
+    examples=None,
+    N=192,
+    T=700.0,
+    dt=0.02,
+    dtau=0.12,
+    tau_max=30.0,
+    sim_reps=1,
+    plot_dir=None,
+    theory_variants=None,
+):
+    """Grid of phase-network examples comparing simulation to theory variants."""
+    import os
+
+    if plot_dir is None:
+        plot_dir = os.path.join(os.path.dirname(os.path.abspath(__file__)), "..", "data", "plots")
+    os.makedirs(plot_dir, exist_ok=True)
+
+    if examples is None:
+        examples = []
+        for g_val in (1.1, 1.3, 1.5):
+            sc = _phase_sigma_c(1.0, 1.0)
+            examples.append(dict(I=1.0, alpha=1.0, beta=1.0, sigma=g_val * sc,
+                                 label=fr"$\alpha=1,\ \beta=1,\ g={g_val:.1f}$"))
+        sc = _phase_sigma_c(1.0, 2.0)
+        examples.append(dict(I=1.0, alpha=2.0, beta=1.0, sigma=1.3 * sc,
+                             label=fr"$\alpha=2,\ \beta=1,\ g=1.3$"))
+        sc = _phase_sigma_c(1.0, 0.5)
+        examples.append(dict(I=1.0, alpha=0.5, beta=1.0, sigma=1.3 * sc,
+                             label=fr"$\alpha=0.5,\ \beta=1,\ g=1.3$"))
+        sc = _phase_sigma_c(1.0, 1.0)
+        examples.append(dict(I=1.0, alpha=1.0, beta=0.5, sigma=1.3 * sc,
+                             label=fr"$\alpha=1,\ \beta=0.5,\ g=1.3$"))
+
+    if theory_variants is None:
+        theory_variants = [
+            dict(
+                label="shot-kick FD",
+                kwargs=dict(solver="fd", q_method="qmc", n_qmc=1024, fd_max_nfev=120),
+                style=dict(color="C3", ls="--", lw=1.7),
+            ),
+            dict(
+                label=r"gen. FD",
+                kwargs=dict(
+                    solver="fd", kernel_omega=2.0, kernel_damping=1.0,
+                    q_method="qmc", n_qmc=1024, fd_max_nfev=120,
+                ),
+                style=dict(color="C1", ls="-.", lw=1.8),
+            ),
+            dict(
+                label=r"infl. IC + gen.",
+                kwargs=dict(
+                    solver="inflated_ic", kernel_omega=2.0, kernel_damping=1.0,
+                    q_method="qmc", n_qmc=1024,
+                ),
+                style=dict(color="C4", ls=(0, (5, 2)), lw=1.8),
+            ),
+        ]
+
+    n = len(examples)
+    ncols = min(3, n)
+    nrows = (n + ncols - 1) // ncols
+    fig, axes = plt.subplots(nrows, ncols, figsize=(5.2 * ncols, 4.0 * nrows))
+    axes_flat = np.array(axes).reshape(-1)
+
+    for ax, ex in zip(axes_flat, examples):
+        I = ex.get("I", 1.0)
+        alpha = ex.get("alpha", 1.0)
+        beta = ex.get("beta", 1.0)
+        sigma = ex["sigma"]
+        sigma_c = _phase_sigma_c(I, alpha)
+        label = ex.get("label", fr"$g={sigma/sigma_c:.2f}$")
+        print(f"  example {label}: sigma={sigma:.3f}, sigma/sigma_c={sigma/sigma_c:.2f}")
+
+        C_runs = []
+        tau_s = None
+        for _ in range(max(1, int(sim_reps))):
+            tau_run, C_run = sim_phase_network(
+                N=N, I=I, alpha=alpha, sigma=sigma, beta=beta,
+                T=T, dt=dt, tau_max=tau_max, n_probe=N,
+            )
+            tau_s = tau_run
+            C_runs.append(C_run)
+        C_s = np.mean(C_runs, axis=0)
+        C_s_norm = C_s / C_s[0] if C_s[0] > 0 else C_s
+        ax.plot(tau_s, C_s_norm, color="C0", lw=1.5, label=f"Sim")
+
+        for variant in theory_variants:
+            kwargs = dict(variant.get("kwargs", {}))
+            style = dict(variant.get("style", {}))
+            vlabel = variant.get("label", kwargs.get("solver", "theory"))
+            try:
+                tau_th, C_th, _ = theory_phase_autocorr(
+                    I=I, alpha=alpha, sigma=sigma, beta=beta,
+                    tau_max=tau_max, dtau=dtau, **kwargs,
+                )
+                norm = max(abs(C_th[0]), 1e-12)
+                ax.plot(tau_th, C_th / norm, label=vlabel, **style)
+            except Exception as err:
+                print(f"    theory variant failed ({vlabel}): {err}")
+
+        ax.axhline(0, color="k", lw=0.5)
+        ax.set(
+            xlabel=r"$\tau$",
+            ylabel=r"$C_{uu}(\tau)/C_{uu}(0)$",
+            title=label,
+            xlim=(0, tau_max),
+            ylim=(-0.35, 1.1),
+        )
+        ax.legend(fontsize=7)
+
+    for ax in axes_flat[n:]:
+        ax.set_visible(False)
+
+    plt.suptitle("Phase network: theory variants across parameters", fontsize=13, fontweight="bold")
+    plt.tight_layout()
+    outpath = os.path.join(plot_dir, "phase_theory_examples.png")
+    plt.savefig(outpath, dpi=150)
+    print(f"Saved to {outpath}")
+    plt.close("all")
+
+
+def plot_phase_beta_scaling_diagnostic(
+    beta_vals=(0.5, 1.0, 2.0),
+    I=1.0,
+    alpha=1.0,
+    g_val=1.3,
+    N=192,
+    T=700.0,
+    dt=0.02,
+    dtau=0.12,
+    tau_max=25.0,
+    sim_reps=1,
+    plot_dir=None,
+    theory_kwargs=None,
+):
+    """Check whether phase theory and simulation scale consistently with beta."""
+    import os
+
+    if plot_dir is None:
+        plot_dir = os.path.join(os.path.dirname(os.path.abspath(__file__)), "..", "data", "plots")
+    os.makedirs(plot_dir, exist_ok=True)
+
+    if theory_kwargs is None:
+        theory_kwargs = dict(
+            solver="fd",
+            kernel_omega=2.0,
+            kernel_damping=1.0,
+            kernel_scaled_by_beta=True,
+            q_method="qmc",
+            n_qmc=1024,
+            fd_max_nfev=140,
+        )
+    else:
+        theory_kwargs = dict(theory_kwargs)
+
+    sigma_c = _phase_sigma_c(I, alpha)
+    sigma = g_val * sigma_c
+
+    n = len(beta_vals)
+    fig, axes = plt.subplots(1, n, figsize=(5.2 * n, 4.0))
+    if n == 1:
+        axes = [axes]
+
+    for ax, beta in zip(axes, beta_vals):
+        print(f"  beta scaling: beta={beta:g}, sigma={sigma:.3f}, g={g_val:.2f}")
+        C_runs = []
+        tau_s = None
+        for _ in range(max(1, int(sim_reps))):
+            tau_run, C_run = sim_phase_network(
+                N=N, I=I, alpha=alpha, sigma=sigma, beta=beta,
+                T=T, dt=dt, tau_max=tau_max, n_probe=N,
+            )
+            tau_s = tau_run
+            C_runs.append(C_run)
+        C_s = np.mean(C_runs, axis=0)
+        ax.plot(beta * tau_s, C_s / max(abs(C_s[0]), 1e-12),
+                color="C0", lw=1.6, label="Sim")
+
+        try:
+            tau_th, C_th, _ = theory_phase_autocorr(
+                I=I, alpha=alpha, sigma=sigma, beta=beta,
+                tau_max=tau_max, dtau=dtau, **theory_kwargs,
+            )
+            ax.plot(beta * tau_th, C_th / max(abs(C_th[0]), 1e-12),
+                    color="C1", ls="--", lw=2.0, label="Theory")
+        except Exception as err:
+            print(f"    theory failed for beta={beta:g}: {err}")
+
+        ax.axhline(0, color="k", lw=0.5)
+        ax.set(
+            xlabel=r"$\beta\tau$",
+            ylabel=r"$C_{uu}(\tau)/C_{uu}(0)$",
+            title=fr"$\beta={beta:g}$",
+            xlim=(0, beta * tau_max),
+            ylim=(-0.35, 1.1),
+        )
+        ax.legend(fontsize=8)
+
+    plt.suptitle(
+        fr"Phase beta-scaling diagnostic: $\alpha={alpha}$, $g={g_val}$",
+        fontsize=13, fontweight="bold",
+    )
+    plt.tight_layout()
+    outpath = os.path.join(plot_dir, "phase_beta_scaling_diagnostic.png")
+    plt.savefig(outpath, dpi=150)
+    print(f"Saved to {outpath}")
+    plt.close("all")
+
+
+# -----------------------------------------------------------------------------
+# Phase model: timeseries and raster helpers
+# -----------------------------------------------------------------------------
+
+def _sim_phase_timeseries(
+    N=256,
+    I=1.0,
+    alpha=1.0,
+    sigma=7.0,
+    beta=1.0,
+    T=500.0,
+    dt=0.02,
+    n_show=20,
+    burn=200.0,
+    rng_=None,
+):
+    """Simulate phase network and return raw u timeseries and per-neuron spike times.
+
+    Returns
+    -------
+    t         : (nt,) time array
+    U         : (nt, n_show) u-values for the first n_show neurons
+    spk_times : list of n_show arrays, each holding spike times for that neuron
+    """
+    if rng_ is None:
+        rng_ = np.random.default_rng(42)
+    n_show = min(n_show, N)
+    W = make_weights(N, sigma, lam=1, rng=rng_)
+    phi = rng_.uniform(-np.pi, np.pi, N)
+    u = np.zeros(N)
+
+    def F(u_):
+        return alpha * np.clip(I + u_, 0.0, 1e12) ** (1.0 / alpha)
+
+    nb = int(burn / dt)
+    for _ in range(nb):
+        phi += F(u) * dt
+        spike_counts = np.floor((phi + np.pi) / (2.0 * np.pi)).astype(float)
+        spikes = spike_counts > 0
+        phi[spikes] = ((phi[spikes] + np.pi) % (2.0 * np.pi)) - np.pi
+        drive = W @ spike_counts
+        u += -beta * u * dt + beta * drive
+        if not np.all(np.isfinite(u)):
+            u = np.nan_to_num(u, nan=0.0, posinf=1e6, neginf=-1e6)
+
+    nt = int(T / dt)
+    t = np.arange(nt) * dt
+    idx = np.arange(n_show)
+    U = np.zeros((nt, n_show))
+    spk_times = [[] for _ in range(n_show)]
+
+    for step in range(nt):
+        phi += F(u) * dt
+        spike_counts = np.floor((phi + np.pi) / (2.0 * np.pi)).astype(float)
+        spikes = spike_counts > 0
+        phi[spikes] = ((phi[spikes] + np.pi) % (2.0 * np.pi)) - np.pi
+        drive = W @ spike_counts
+        u += -beta * u * dt + beta * drive
+        if not np.all(np.isfinite(u)):
+            u = np.nan_to_num(u, nan=0.0, posinf=1e6, neginf=-1e6)
+        U[step] = u[idx]
+        for k in range(n_show):
+            count = int(spike_counts[idx[k]])
+            if count:
+                spk_times[k].extend([t[step]] * count)
+
+    return t, U, [np.array(st) for st in spk_times]
+
+
+def _phase_sigma_c(I, alpha):
+    rho = 1.0 / (2.0 * np.pi)
+    Fprime0 = float(np.maximum(I, 1e-10) ** (1.0 / alpha - 1.0))
+    return 1.0 / (rho * Fprime0)
+
+
+# -----------------------------------------------------------------------------
+# 1. u(t) time series
+# -----------------------------------------------------------------------------
+
+def plot_u_timeseries(
+    sigma_vals=None,
+    I=1.0,
+    alpha=1.0,
+    beta=1.0,
+    N=256,
+    T=200.0,
+    dt=0.02,
+    n_show=8,
+    burn=100.0,
+    plot_dir=None,
+):
+    """Plot u(t) traces for several neurons across sigma values.
+
+    One column per sigma value; each panel shows n_show overlaid traces.
+    """
+    import os
+    if plot_dir is None:
+        plot_dir = os.path.join(os.path.dirname(os.path.abspath(__file__)), "..", "data", "plots")
+    os.makedirs(plot_dir, exist_ok=True)
+
+    sigma_c = _phase_sigma_c(I, alpha)
+    if sigma_vals is None:
+        sigma_vals = [0.5 * sigma_c, 1.0 * sigma_c, 2.0 * sigma_c]
+
+    ncols = len(sigma_vals)
+    fig, axes = plt.subplots(1, ncols, figsize=(5 * ncols, 4), sharey=False)
+    if ncols == 1:
+        axes = [axes]
+
+    for ax, sigma in zip(axes, sigma_vals):
+        g = sigma / sigma_c
+        print(f"  u timeseries: sigma={sigma:.2f} (g={g:.2f})")
+        t, U, _ = _sim_phase_timeseries(
+            N=N, I=I, alpha=alpha, sigma=sigma, beta=beta,
+            T=T, dt=dt, n_show=n_show, burn=burn,
+        )
+        for k in range(n_show):
+            ax.plot(t, U[:, k], lw=0.8, alpha=0.7)
+        ax.set(
+            xlabel="time",
+            ylabel=r"$u_i(t)$",
+            title=fr"$\sigma={sigma:.2f}$, $g=\sigma/\sigma_c={g:.2f}$",
+        )
+
+    plt.suptitle(
+        fr"Phase network: $u(t)$ time series  ($I={I}$, $\alpha={alpha}$, $\sigma_c={sigma_c:.2f}$)",
+        fontsize=12, fontweight="bold",
+    )
+    plt.tight_layout()
+    outpath = os.path.join(plot_dir, "phase_u_timeseries.png")
+    plt.savefig(outpath, dpi=150)
+    print(f"Saved to {outpath}")
+    plt.close("all")
+
+
+# -----------------------------------------------------------------------------
+# 2. Spike raster + population rate
+# -----------------------------------------------------------------------------
+
+def plot_phase_raster(
+    sigma_vals=None,
+    I=1.0,
+    alpha=1.0,
+    beta=1.0,
+    N=256,
+    T=500.0,
+    dt=0.02,
+    burn=100.0,
+    plot_dir=None,
+):
+    """Spike raster (neuron index vs time) + population rate for several sigma.
+
+    Two rows per sigma: raster (top), smoothed population firing rate (bottom).
+    """
+    import os
+    if plot_dir is None:
+        plot_dir = os.path.join(os.path.dirname(os.path.abspath(__file__)), "..", "data", "plots")
+    os.makedirs(plot_dir, exist_ok=True)
+
+    sigma_c = _phase_sigma_c(I, alpha)
+    if sigma_vals is None:
+        sigma_vals = [0.5 * sigma_c, 1.0 * sigma_c, 2.0 * sigma_c]
+
+    ncols = len(sigma_vals)
+    fig, axes = plt.subplots(
+        2, ncols, figsize=(5 * ncols, 6),
+        gridspec_kw={"height_ratios": [3, 1]},
+    )
+    if ncols == 1:
+        axes = axes.reshape(2, 1)
+
+    for col, sigma in enumerate(sigma_vals):
+        g = sigma / sigma_c
+        print(f"  raster: sigma={sigma:.2f} (g={g:.2f})")
+        t, _, spk_times = _sim_phase_timeseries(
+            N=N, I=I, alpha=alpha, sigma=sigma, beta=beta,
+            T=T, dt=dt, n_show=N, burn=burn,
+        )
+        ax_raster = axes[0, col]
+        ax_rate   = axes[1, col]
+
+        # Raster
+        for k, st in enumerate(spk_times):
+            if len(st):
+                ax_raster.scatter(st, np.full(len(st), k), s=0.5, c="k", linewidths=0)
+        ax_raster.set(
+            xlim=(0, T), ylim=(-1, N),
+            ylabel="neuron" if col == 0 else "",
+            title=fr"$\sigma={sigma:.2f}$, $g={g:.2f}$",
+        )
+        ax_raster.tick_params(labelbottom=False)
+
+        # Population rate (smoothed)
+        nt = len(t)
+        pop_rate = np.zeros(nt)
+        for st in spk_times:
+            for ts in st:
+                idx = int(ts / dt)
+                if idx < nt:
+                    pop_rate[idx] += 1.0
+        pop_rate /= N * dt
+        win = max(1, int(5.0 / dt))
+        pop_rate_sm = np.convolve(pop_rate, np.ones(win) / win, mode="same")
+        ax_rate.plot(t, pop_rate_sm, lw=1.0, color="steelblue")
+        ax_rate.set(
+            xlabel="time",
+            ylabel="rate" if col == 0 else "",
+            xlim=(0, T),
+        )
+
+    plt.suptitle(
+        fr"Phase network: spike raster  ($I={I}$, $\alpha={alpha}$, $\sigma_c={sigma_c:.2f}$)",
+        fontsize=12, fontweight="bold",
+    )
+    plt.tight_layout()
+    outpath = os.path.join(plot_dir, "phase_raster.png")
+    plt.savefig(outpath, dpi=150)
+    print(f"Saved to {outpath}")
+    plt.close("all")
+
+
+# -----------------------------------------------------------------------------
+# Parallel simulation helper (module-level so ProcessPoolExecutor can pickle it)
+# -----------------------------------------------------------------------------
+
+def _phase_sim_job(kwargs):
+    """Worker for parallel sim_phase_network calls.
+
+    kwargs must contain a 'seed' key (int or None) — a fresh rng is created
+    per job so workers don't share RNG state.
+    """
+    seed = kwargs.pop("seed", None)
+    job_rng = np.random.default_rng(seed)
+    return sim_phase_network(**kwargs, rng=job_rng)
+
+
+def _run_jobs_parallel(jobs, n_jobs):
+    """Run a list of job-dicts via _phase_sim_job, returning results in order.
+
+    n_jobs=1  → sequential (no extra processes).
+    n_jobs>1  → ProcessPoolExecutor with that many workers.
+    n_jobs=-1 → use os.cpu_count() workers.
+    """
+    import os, sys
+    from concurrent.futures import ProcessPoolExecutor
+
+    if n_jobs == 1:
+        return [_phase_sim_job(dict(j)) for j in jobs]
+
+    workers = os.cpu_count() if n_jobs == -1 else int(n_jobs)
+    # Use 'fork' on POSIX so child processes inherit the already-imported
+    # module state without re-executing __main__, avoiding the recursive-spawn
+    # problem that occurs on macOS when the start method is 'spawn'.
+    mp_ctx = None
+    if sys.platform != "win32":
+        import multiprocessing
+        mp_ctx = multiprocessing.get_context("fork")
+    try:
+        with ProcessPoolExecutor(max_workers=workers, mp_context=mp_ctx) as ex:
+            return list(ex.map(_phase_sim_job, [dict(j) for j in jobs]))
+    except PermissionError as err:
+        print(f"  Parallel workers unavailable ({err}); running sequentially.")
+        return [_phase_sim_job(dict(j)) for j in jobs]
+
+
+def _phase_theory_label(theory_kwargs):
+    solver = str(theory_kwargs.get("solver", "fd")).replace("_", "-")
+    q_method = str(theory_kwargs.get("q_method", "gh"))
+    return theory_kwargs.get("label", f"2PI {solver}/{q_method}")
+
+
+# -----------------------------------------------------------------------------
+# 3. Sim vs theory: parameter dependence
+# -----------------------------------------------------------------------------
+
+def plot_phase_corr_params(
+    param_sets=None,
+    N=512,
+    T=5000.0,
+    dt=0.02,
+    tau_max=80.0,
+    sim_reps=2,
+    plot_dir=None,
+    n_jobs=1,
+    theory_kwargs=None,
+):
+    """Sim vs theory C_uu(tau) for different parameter combinations.
+
+    param_sets : list of dicts with keys I, alpha, beta, sigma (absolute values),
+                 and optional 'label'. Theory is shown only when sigma < sigma_c.
+    """
+    import os
+    if plot_dir is None:
+        plot_dir = os.path.join(os.path.dirname(os.path.abspath(__file__)), "..", "data", "plots")
+    os.makedirs(plot_dir, exist_ok=True)
+    theory_kwargs = {} if theory_kwargs is None else dict(theory_kwargs)
+
+    if param_sets is None:
+        sc1 = _phase_sigma_c(1.0, 1.0)   # I=1, alpha=1
+        sc2 = _phase_sigma_c(1.0, 2.0)   # I=1, alpha=2
+        sc05 = _phase_sigma_c(1.0, 0.5)  # I=1, alpha=0.5
+        param_sets = [
+            dict(I=1.0, alpha=1.0, beta=1.0, sigma=1.1 * sc1,
+                 label=r"$\sigma=1.1\sigma_c$, $\alpha=1$"),
+            dict(I=1.0, alpha=1.0, beta=1.0, sigma=1.3 * sc1,
+                 label=r"$\sigma=1.3\sigma_c$, $\alpha=1$"),
+            dict(I=1.0, alpha=1.0, beta=1.0, sigma=1.5 * sc1,
+                 label=r"$\sigma=1.5\sigma_c$, $\alpha=1$"),
+            dict(I=1.0, alpha=2.0, beta=1.0, sigma=1.3 * sc2,
+                 label=r"$\sigma=1.3\sigma_c$, $\alpha=2$"),
+            dict(I=1.0, alpha=0.5, beta=1.0, sigma=0.75 * sc05,
+                 label=r"$\sigma=0.75\sigma_c$, $\alpha=0.5$"),
+            dict(I=1.0, alpha=1.0, beta=0.5, sigma=1.3 * sc1,
+                 label=r"$\sigma=1.3\sigma_c$, $\beta=0.5$"),
+        ]
+
+    n = len(param_sets)
+    ncols = min(n, 3)
+    nrows = (n + ncols - 1) // ncols
+    fig, axes = plt.subplots(nrows, ncols, figsize=(5 * ncols, 4 * nrows))
+    axes_flat = np.array(axes).flatten()
+
+    # Build all sim jobs up-front so they can be dispatched in parallel.
+    ss = np.random.SeedSequence()
+    all_jobs = []
+    for ps in param_sets:
+        for _ in range(max(1, sim_reps)):
+            seed = int(ss.spawn(1)[0].generate_state(1)[0])
+            all_jobs.append(dict(
+                N=N, I=ps["I"], alpha=ps["alpha"], sigma=ps["sigma"],
+                beta=ps["beta"], T=T, dt=dt, tau_max=tau_max, n_probe=N,
+                seed=seed,
+            ))
+
+    print(f"  Dispatching {len(all_jobs)} sims (n_jobs={n_jobs}) …")
+    all_results = _run_jobs_parallel(all_jobs, n_jobs)
+
+    result_iter = iter(all_results)
+    for ax, ps in zip(axes_flat, param_sets):
+        I_ = ps["I"]; alpha_ = ps["alpha"]; beta_ = ps["beta"]; sigma_ = ps["sigma"]
+        label = ps.get("label", fr"$\sigma={sigma_:.2f}$")
+        sigma_c_ = _phase_sigma_c(I_, alpha_)
+        print(f"  {label}  (sigma/sigma_c={sigma_/sigma_c_:.2f})")
+
+        # Theory
+        try:
+            tau_th, C_th, _ = theory_phase_autocorr(
+                I=I_, alpha=alpha_, sigma=sigma_, beta=beta_,
+                tau_max=tau_max, dtau=dt, **theory_kwargs,
+            )
+        except Exception as e:
+            print(f"  theory failed: {e}")
+            tau_th, C_th = None, None
+
+        # Collect the pre-computed simulation results for this param set.
+        C_runs = []
+        tau_s = None
+        for _ in range(max(1, sim_reps)):
+            tau_run, C_run = next(result_iter)
+            tau_s = tau_run
+            C_runs.append(C_run)
+        C_s = np.mean(C_runs, axis=0)
+
+        C_s_norm = C_s / C_s[0] if C_s[0] > 0 else C_s
+        has_theory = C_th is not None and C_th[0] > 1e-2
+        if has_theory:
+            C_th_norm = C_th / C_th[0]
+            ax.plot(tau_th, C_th_norm, "r--", lw=2,
+                    label=_phase_theory_label(theory_kwargs), zorder=3)
+        ax.plot(tau_s, C_s_norm, "b", lw=1.5, alpha=0.85, label="Sim", zorder=2)
+        ax.axhline(0, color="k", lw=0.5)
+        ax.set(
+            xlabel=r"$\tau$", ylabel=r"$C_{uu}(\tau) / C_{uu}(0)$",
+            ylim=(-0.2, 1.05),
+            title=label, xlim=(0, tau_max),
+        )
+        ax.legend(fontsize=8)
+
+    for ax in axes_flat[n:]:
+        ax.set_visible(False)
+
+    plt.suptitle(
+        "Phase network: sim vs theory — parameter dependence",
+        fontsize=13, fontweight="bold",
+    )
+    plt.tight_layout()
+    outpath = os.path.join(plot_dir, "phase_corr_params.png")
+    plt.savefig(outpath, dpi=150)
+    print(f"Saved to {outpath}")
+    plt.close("all")
+
+
+# -----------------------------------------------------------------------------
+# 4. Sim vs theory: N convergence
+# -----------------------------------------------------------------------------
+
+def plot_phase_corr_N(
+    N_vals=None,
+    sigma=None,
+    I=1.0,
+    alpha=1.0,
+    beta=1.0,
+    T=5000.0,
+    dt=0.02,
+    tau_max=80.0,
+    plot_dir=None,
+    n_jobs=1,
+    theory_kwargs=None,
+):
+    """Sim vs theory C_uu(tau) for different N (finite-size convergence).
+
+    Three panels: subcritical / near-critical / chaotic regimes.
+    Each panel overlays all N values; theory shown when available.
+    """
+    import os
+    if plot_dir is None:
+        plot_dir = os.path.join(os.path.dirname(os.path.abspath(__file__)), "..", "data", "plots")
+    os.makedirs(plot_dir, exist_ok=True)
+    theory_kwargs = {} if theory_kwargs is None else dict(theory_kwargs)
+
+    if N_vals is None:
+        N_vals = (64, 128, 256, 512, 1024)
+
+    sigma_c = _phase_sigma_c(I, alpha)
+
+    if sigma is None:
+        sigma_list = [1.1 * sigma_c, 1.3 * sigma_c, 1.5 * sigma_c]
+        regime_labels = [
+            fr"near-critical ($g=1.1$)",
+            fr"supercritical ($g=1.3$)",
+            fr"supercritical ($g=1.5$)",
+        ]
+    else:
+        sigma_list = [sigma]
+        regime_labels = [fr"$\sigma={sigma:.2f}$"]
+
+    ncols = len(sigma_list)
+    fig, axes = plt.subplots(1, ncols, figsize=(5 * ncols, 4))
+    if ncols == 1:
+        axes = [axes]
+
+    colors = plt.cm.viridis(np.linspace(0.1, 0.9, len(N_vals)))
+
+    # Build all sim jobs so they can be dispatched in parallel.
+    ss = np.random.SeedSequence()
+    all_jobs = []
+    for sig in sigma_list:
+        for N in N_vals:
+            seed = int(ss.spawn(1)[0].generate_state(1)[0])
+            all_jobs.append(dict(
+                N=N, I=I, alpha=alpha, sigma=sig, beta=beta,
+                T=T, dt=dt, tau_max=tau_max, n_probe=N,
+                seed=seed,
+            ))
+
+    print(f"  Dispatching {len(all_jobs)} sims (n_jobs={n_jobs}) …")
+    all_results = _run_jobs_parallel(all_jobs, n_jobs)
+
+    for ax, sig, rlabel in zip(axes, sigma_list, regime_labels):
+        print(f"  N-convergence: sigma={sig:.2f} (g={sig/sigma_c:.2f})")
+
+        # Theory — only plot when a valid SCS fixed point was found
+        try:
+            tau_th, C_th, _ = theory_phase_autocorr(
+                I=I, alpha=alpha, sigma=sig, beta=beta, tau_max=tau_max, dtau=dt,
+                **theory_kwargs,
+            )
+            if C_th[0] > 1e-2:
+                C_th_norm = C_th / C_th[0]
+                ax.plot(tau_th, C_th_norm, "k--", lw=2.5, zorder=6,
+                        label=_phase_theory_label(theory_kwargs))
+        except Exception as e:
+            print(f"  theory failed: {e}")
+
+        n_sigma = len(sigma_list)
+        sig_idx = sigma_list.index(sig)
+        for i, (N, color) in enumerate(zip(N_vals, colors)):
+            tau_s, C_s = all_results[sig_idx * len(N_vals) + i]
+            print(f"    N={N}")
+            C_s_norm = C_s / C_s[0] if C_s[0] > 0 else C_s
+            ax.plot(tau_s, C_s_norm, lw=1.3, color=color, alpha=0.85, label=f"N={N}")
+
+        ax.axhline(0, color="k", lw=0.5)
+        ax.set(
+            xlabel=r"$\tau$", ylabel=r"$C_{uu}(\tau) / C_{uu}(0)$",
+            ylim=(-0.2, 1.05),
+            title=rlabel, xlim=(0, tau_max),
+        )
+        ax.legend(fontsize=8)
+
+    plt.suptitle(
+        fr"Phase network: finite-size convergence  ($I={I}$, $\alpha={alpha}$, $\sigma_c={sigma_c:.2f}$)",
+        fontsize=12, fontweight="bold",
+    )
+    plt.tight_layout()
+    outpath = os.path.join(plot_dir, "phase_corr_N.png")
+    plt.savefig(outpath, dpi=150)
+    print(f"Saved to {outpath}")
+    plt.close("all")
+
+
+# -----------------------------------------------------------------------------
+# Main

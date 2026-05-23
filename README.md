@@ -12,7 +12,11 @@ measures are summarized in [docs/theory_closures.md](docs/theory_closures.md).
 ```text
 RandomNet/
 ├── scripts/
-│   ├── random_network.py      # Main simulation/theory/plotting module
+│   ├── random_network.py      # Compatibility facade and legacy __main__
+│   ├── rn_core.py             # Shared RNG, weights, autocorrelation helpers
+│   ├── rn_rate.py             # Rate-network simulation/theory/plots
+│   ├── rn_phase.py            # Phase-network simulation/theory/plots
+│   ├── rn_binary.py           # Binary-neuron simulation/theory/plots
 │   └── make_quick_plots.py    # Small binary/rate plotting script
 ├── data/
 │   └── plots/                 # Generated figures
@@ -69,13 +73,16 @@ All plots should be written under `data/plots/`.
 
 ## Main Theory Entrypoints
 
-- `theory_rate_autocorr`: rate-network SCS theory.
-- `theory_phase_autocorr`: phase-network closures, including finite-difference,
+- `rn_rate.theory_rate_autocorr`: rate-network SCS theory.
+- `rn_phase.theory_phase_autocorr`: phase-network closures, including finite-difference,
   inflated-initial-condition, and Hermite covariance options.
-- `phase_operational_criticality`: branch-existence criticality for a selected
+- `rn_phase.phase_operational_criticality`: branch-existence criticality for a selected
   phase closure.
-- `theory_binary_autocorr`: exact linear binary-neuron theory.
-- `theory_binary_clipped_integral`: clipped binary-neuron integral closure.
+- `rn_binary.theory_binary_autocorr`: exact linear binary-neuron theory.
+- `rn_binary.theory_binary_clipped_integral`: clipped binary-neuron integral closure.
 
 See [docs/theory_closures.md](docs/theory_closures.md) before interpreting
 plots, because several approximations are intentionally kept on the table.
+
+For backward compatibility, these names are also re-exported by
+`scripts/random_network.py`.

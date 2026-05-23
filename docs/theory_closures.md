@@ -16,7 +16,7 @@ is assumed to be universally correct.
 
 ## Phase Network
 
-The main phase-theory entry point is:
+The phase implementation lives in `scripts/rn_phase.py`.  The main entry point is:
 
 ```python
 theory_phase_autocorr(...)
@@ -69,7 +69,8 @@ Hermite/inflated-IC closure give `alpha=0.5` around `g_branch ~= 0.75`.
 
 ## Binary Network
 
-The exact linear-gain theory remains:
+The binary implementation lives in `scripts/rn_binary.py`.  The exact
+linear-gain theory remains:
 
 ```python
 theory_binary_autocorr(...)
@@ -101,3 +102,5 @@ plot_clipped_vs_linear(...)
 ```
 
 All generated figures should be written to `data/plots/`.
+
+`scripts/random_network.py` re-exports the split modules for older scripts.
