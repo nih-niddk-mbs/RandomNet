@@ -1,82 +1,81 @@
 # RandomNet
 
-Code to simulate and analyze randomly connected neural networks.
+Simulation and theory experiments for randomly connected neural networks,
+including rate, phase/spiking, and binary-neuron models.
 
-## Repository Structure
+The current focus is comparing simulations with several 2PI/Gaussian-closure
+approximations.  Theory details and the meaning of the different criticality
+measures are summarized in [docs/theory_closures.md](docs/theory_closures.md).
 
-```
+## Repository Layout
+
+```text
 RandomNet/
-├── randomnet/              # Main Python package
-├── scripts/                # Simulation and analysis scripts
-│   ├── random_network.py   # Core simulation code
-│   └── make_quick_plots.py
+├── scripts/
+│   ├── random_network.py      # Main simulation/theory/plotting module
+│   └── make_quick_plots.py    # Small binary/rate plotting script
 ├── data/
-│   ├── plots/             # All visualization outputs
-│   └── results/           # Simulation results and cache
-├── tests/                 # Test and debugging scripts
-├── julia/                 # Julia implementation (reference)
-├── environment.yml        # Conda environment specification
-└── pyproject.toml         # Python package configuration
+│   └── plots/                 # Generated figures
+├── docs/
+│   └── theory_closures.md     # Notes on closures and criticality
+├── tests/                     # Development diagnostics
+├── julia/                     # Reference/older Julia implementation
+├── environment.yml
+└── pyproject.toml
 ```
 
-## Setup
+## Environment
 
-### Create Conda Environment
-
-```bash
-conda env create -f environment.yml -p ./miniconda/envs/randomnet
-conda activate randomnet
-```
-
-Alternatively, if using existing miniconda installation:
-
-```bash
-~/miniconda/bin/conda env create -f environment.yml
-source ~/miniconda/etc/profile.d/conda.sh
-conda activate randomnet
-```
-
-## Running Simulations
-
-All simulation results and plots are saved to `data/plots/`:
-
-```bash
-cd scripts
-python random_network.py
-```
-
-## File Organization
-
-- **randomnet/**: Python package modules for network simulations
-- **scripts/**: Executable simulation and plotting scripts
-- **data/**: All numerical results and visualizations
-- **tests/**: Development and debugging scripts  
-- **julia/**: Reference Julia implementation (not actively maintained)
-	`theory_phase_autocorr`, `plot_phase_network`).
-
-### Conda environment (recommended)
-
-Create and activate the Conda environment:
+Recommended Conda environment:
 
 ```bash
 conda env create -f environment.yml
 conda activate randomnet-py
 ```
 
-Run:
+On this workstation, the environment is commonly run via:
 
 ```bash
-python python/simulations/random_network.py
+/Users/carsonc/miniconda3/bin/conda run -n randomnet-py python ...
 ```
 
-Install Python dependencies:
+## Common Commands
+
+Compile-check the main scripts:
 
 ```bash
-python -m pip install -r python/requirements.txt
+python -m py_compile scripts/random_network.py run_phase_plots.py
 ```
 
-Run:
+Generate the phase comparison plots:
 
 ```bash
-python python/simulations/random_network.py
+python run_phase_plots.py
 ```
+
+Generate quick binary/rate plots:
+
+```bash
+python scripts/make_quick_plots.py
+```
+
+Run the full legacy plotting script:
+
+```bash
+python scripts/random_network.py
+```
+
+All plots should be written under `data/plots/`.
+
+## Main Theory Entrypoints
+
+- `theory_rate_autocorr`: rate-network SCS theory.
+- `theory_phase_autocorr`: phase-network closures, including finite-difference,
+  inflated-initial-condition, and Hermite covariance options.
+- `phase_operational_criticality`: branch-existence criticality for a selected
+  phase closure.
+- `theory_binary_autocorr`: exact linear binary-neuron theory.
+- `theory_binary_clipped_integral`: clipped binary-neuron integral closure.
+
+See [docs/theory_closures.md](docs/theory_closures.md) before interpreting
+plots, because several approximations are intentionally kept on the table.
