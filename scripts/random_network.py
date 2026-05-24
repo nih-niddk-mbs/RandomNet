@@ -15,6 +15,9 @@ from rn_rate import *  # noqa: F401,F403
 from rn_phase import *  # noqa: F401,F403
 from rn_binary import *  # noqa: F401,F403
 
+# Private-but-used helper exports kept for compatibility with exploratory scripts.
+from rn_phase import _phase_sigma_c  # noqa: F401
+
 
 if __name__ == "__main__":
     import os

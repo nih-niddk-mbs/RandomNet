@@ -27,6 +27,7 @@ def sim_phase_network(
     n_probe=None,
     return_spike=False,
     return_u=False,
+    synapse_update="exact",
     rng=rng,
 ):
     """Simulate a phase-reset network and return C_uu(tau).
@@ -38,21 +39,51 @@ def sim_phase_network(
     W = make_weights(N, sigma, lam, rng)
     phi = rng.uniform(-np.pi, np.pi, N)
     u = np.zeros(N)
+    synapse_update = str(synapse_update).lower()
+    if synapse_update not in ("exact", "euler"):
+        raise ValueError("synapse_update must be 'exact' or 'euler'")
 
     def F(u_):
         return alpha * np.clip(I + u_, 0.0, 1e12) ** (1.0 / alpha)
 
+    def spike_weights(phi_old, rate, spike_counts):
+        """Return per-neuron spike counts, optionally filtered by event time."""
+        if synapse_update == "euler":
+            return spike_counts
+        weighted = np.zeros_like(spike_counts, dtype=float)
+        spiking = np.flatnonzero(spike_counts > 0)
+        for j in spiking:
+            count = int(spike_counts[j])
+            if count <= 0 or rate[j] <= 0.0:
+                continue
+            thresholds = np.pi + 2.0 * np.pi * np.arange(count)
+            crossing_times = (thresholds - phi_old[j]) / rate[j]
+            crossing_times = np.clip(crossing_times, 0.0, dt)
+            weighted[j] = np.sum(np.exp(-beta * (dt - crossing_times)))
+        return weighted
+
+    def update_u(u_, drive_):
+        # Spikes are delta events: integrating beta*W*dN gives beta*W*count,
+        # not beta*W*count*dt.  The exact option also applies exponential leak
+        # over the step, including within-step decay from estimated spike times.
+        if synapse_update == "exact":
+            return np.exp(-beta * dt) * u_ + beta * drive_
+        return u_ + (-beta * u_) * dt + beta * drive_
+
     nb = int(burn / dt)
     for _ in range(nb):
-        phi += F(u) * dt
+        phi_old = phi.copy()
+        rate = F(u)
+        phi = phi_old + rate * dt
         spike_counts = np.floor((phi + np.pi) / (2.0 * np.pi)).astype(float)
         spikes = spike_counts > 0
         # Correct multi-spike: wrap phi into (-pi, pi) regardless of how many
         # cycles were completed in this step (F(u)*dt can exceed 2*pi for large u).
         phi[spikes] = ((phi[spikes] + np.pi) % (2.0 * np.pi)) - np.pi
+        filtered_counts = spike_weights(phi_old, rate, spike_counts)
         with np.errstate(over="ignore", divide="ignore", invalid="ignore"):
-            drive = W @ spike_counts
-        u += -beta * u * dt + beta * drive
+            drive = W @ filtered_counts
+        u = update_u(u, drive)
         if not np.all(np.isfinite(u)):
             u = np.nan_to_num(u, nan=0.0, posinf=1e6, neginf=-1e6)
 
@@ -64,13 +95,16 @@ def sim_phase_network(
     U_probe = np.zeros((nt, n_probe))
     R_pop = np.zeros(nt, dtype=float) if return_spike else None
     for t in range(nt):
-        phi += F(u) * dt
+        phi_old = phi.copy()
+        rate = F(u)
+        phi = phi_old + rate * dt
         spike_counts = np.floor((phi + np.pi) / (2.0 * np.pi)).astype(float)
         spikes = spike_counts > 0
         phi[spikes] = ((phi[spikes] + np.pi) % (2.0 * np.pi)) - np.pi
+        filtered_counts = spike_weights(phi_old, rate, spike_counts)
         with np.errstate(over="ignore", divide="ignore", invalid="ignore"):
-            drive = W @ spike_counts
-        u += -beta * u * dt + beta * drive
+            drive = W @ filtered_counts
+        u = update_u(u, drive)
         if not np.all(np.isfinite(u)):
             u = np.nan_to_num(u, nan=0.0, posinf=1e6, neginf=-1e6)
         U_probe[t] = u[probe_idx]
@@ -1053,6 +1087,8 @@ def plot_phase_spike_correlation(
     dt=0.02,
     dtau=0.02,
     tau_max=120.0,
+    burn=300.0,
+    scale_slow_beta_time=True,
     plot_dir=None,
 ):
     """Compare phase-model spike autocorrelation from simulation and theory."""
@@ -1071,14 +1107,16 @@ def plot_phase_spike_correlation(
     if sigma is None:
         sigma = 0.6 * sigma_c
 
+    slow_factor = _beta_time_factor(beta) if scale_slow_beta_time else 1.0
     tau_s, _Cuu_s, Cspk_s = sim_phase_network(
         N=N,
         I=I,
         alpha=alpha,
         sigma=sigma,
         beta=beta,
-        T=T,
+        T=T * slow_factor,
         dt=dt,
+        burn=burn * slow_factor,
         tau_max=tau_max,
         return_spike=True,
     )
@@ -1127,9 +1165,11 @@ def plot_phase_network(
     dt=0.02,
     dtau=0.02,
     tau_max=120.0,
+    burn=300.0,
     sim_reps=3,
     plot_dir=None,
     theory_kwargs=None,
+    scale_slow_beta_time=True,
 ):
     """Compare phase-network simulation and reduced-theory autocorrelations."""
     import os
@@ -1155,6 +1195,7 @@ def plot_phase_network(
     if sigma_vals is None:
         sigma_vals = [0.75 * sigma_c, 0.95 * sigma_c, 1.1 * sigma_c]
 
+    slow_factor = _beta_time_factor(beta) if scale_slow_beta_time else 1.0
     fig, axes = plt.subplots(1, len(sigma_vals), figsize=(5 * len(sigma_vals), 4))
     if len(sigma_vals) == 1:
         axes = [axes]
@@ -1186,8 +1227,9 @@ def plot_phase_network(
                 alpha=alpha,
                 sigma=sigma,
                 beta=beta,
-                T=T,
+                T=T * slow_factor,
                 dt=dt,
+                burn=burn * slow_factor,
                 tau_max=tau_max,
                 n_probe=N,
             )
@@ -1234,9 +1276,11 @@ def plot_phase_theory_comparison(
     dt=0.02,
     dtau=0.1,
     tau_max=35.0,
+    burn=300.0,
     sim_reps=2,
     plot_dir=None,
     theory_variants=None,
+    scale_slow_beta_time=True,
 ):
     """Overlay simulation with several approximate phase-network theories."""
     import os
@@ -1281,10 +1325,12 @@ def plot_phase_theory_comparison(
 
     C_runs = []
     tau_s = None
+    slow_factor = _beta_time_factor(beta) if scale_slow_beta_time else 1.0
     for _ in range(max(1, int(sim_reps))):
         tau_run, C_run = sim_phase_network(
             N=N, I=I, alpha=alpha, sigma=sigma, beta=beta,
-            T=T, dt=dt, tau_max=tau_max, n_probe=N,
+            T=T * slow_factor, dt=dt, burn=burn * slow_factor,
+            tau_max=tau_max, n_probe=N,
         )
         tau_s = tau_run
         C_runs.append(C_run)
@@ -1331,9 +1377,11 @@ def plot_phase_theory_examples(
     dt=0.02,
     dtau=0.12,
     tau_max=30.0,
+    burn=300.0,
     sim_reps=1,
     plot_dir=None,
     theory_variants=None,
+    scale_slow_beta_time=True,
 ):
     """Grid of phase-network examples comparing simulation to theory variants."""
     import os
@@ -1400,10 +1448,12 @@ def plot_phase_theory_examples(
 
         C_runs = []
         tau_s = None
+        slow_factor = _beta_time_factor(beta) if scale_slow_beta_time else 1.0
         for _ in range(max(1, int(sim_reps))):
             tau_run, C_run = sim_phase_network(
                 N=N, I=I, alpha=alpha, sigma=sigma, beta=beta,
-                T=T, dt=dt, tau_max=tau_max, n_probe=N,
+                T=T * slow_factor, dt=dt, burn=burn * slow_factor,
+                tau_max=tau_max, n_probe=N,
             )
             tau_s = tau_run
             C_runs.append(C_run)
@@ -1456,11 +1506,17 @@ def plot_phase_beta_scaling_diagnostic(
     dt=0.02,
     dtau=0.12,
     tau_max=25.0,
+    burn=300.0,
     sim_reps=1,
     plot_dir=None,
     theory_kwargs=None,
+    scale_slow_beta_time=True,
 ):
-    """Check whether phase theory and simulation scale consistently with beta."""
+    """Check phase theory and simulation on the scaled time axis beta*tau.
+
+    Here tau_max is interpreted as the maximum beta*tau shown in every panel,
+    so the raw simulated/theory lag window is tau_max/beta for each beta.
+    """
     import os
 
     if plot_dir is None:
@@ -1483,48 +1539,65 @@ def plot_phase_beta_scaling_diagnostic(
     sigma_c = _phase_sigma_c(I, alpha)
     sigma = g_val * sigma_c
 
-    n = len(beta_vals)
-    fig, axes = plt.subplots(1, n, figsize=(5.2 * n, 4.0))
-    if n == 1:
-        axes = [axes]
+    beta_vals = tuple(float(b) for b in beta_vals)
+    fig, axes = plt.subplots(1, 2, figsize=(12.5, 4.6), sharey=True)
+    ax_raw, ax_scaled = axes
+    colors = plt.cm.viridis(np.linspace(0.12, 0.88, len(beta_vals)))
+    max_raw_tau = tau_max / max(min(beta_vals), 1e-12)
 
-    for ax, beta in zip(axes, beta_vals):
+    for beta, color in zip(beta_vals, colors):
         print(f"  beta scaling: beta={beta:g}, sigma={sigma:.3f}, g={g_val:.2f}")
         C_runs = []
         tau_s = None
+        slow_factor = _beta_time_factor(beta) if scale_slow_beta_time else 1.0
+        raw_tau_max = tau_max / max(float(beta), 1e-12)
         for _ in range(max(1, int(sim_reps))):
             tau_run, C_run = sim_phase_network(
                 N=N, I=I, alpha=alpha, sigma=sigma, beta=beta,
-                T=T, dt=dt, tau_max=tau_max, n_probe=N,
+                T=T * slow_factor, dt=dt, burn=burn * slow_factor,
+                tau_max=raw_tau_max, n_probe=N,
             )
             tau_s = tau_run
             C_runs.append(C_run)
         C_s = np.mean(C_runs, axis=0)
-        ax.plot(beta * tau_s, C_s / max(abs(C_s[0]), 1e-12),
-                color="C0", lw=1.6, label="Sim")
+        C_s_norm = C_s / max(abs(C_s[0]), 1e-12)
+        ax_raw.plot(tau_s, C_s_norm, color=color, lw=1.8,
+                    label=fr"sim $\beta={beta:g}$")
+        ax_scaled.plot(beta * tau_s, C_s_norm, color=color, lw=1.8,
+                       label=fr"sim $\beta={beta:g}$")
 
         try:
             tau_th, C_th, _ = theory_phase_autocorr(
                 I=I, alpha=alpha, sigma=sigma, beta=beta,
-                tau_max=tau_max, dtau=dtau, **theory_kwargs,
+                tau_max=raw_tau_max, dtau=dtau, **theory_kwargs,
             )
-            ax.plot(beta * tau_th, C_th / max(abs(C_th[0]), 1e-12),
-                    color="C1", ls="--", lw=2.0, label="Theory")
+            C_th_norm = C_th / max(abs(C_th[0]), 1e-12)
+            ax_raw.plot(tau_th, C_th_norm, color=color, ls="--", lw=2.0,
+                        label=fr"theory $\beta={beta:g}$")
+            ax_scaled.plot(beta * tau_th, C_th_norm, color=color, ls="--", lw=2.0,
+                           label=fr"theory $\beta={beta:g}$")
         except Exception as err:
             print(f"    theory failed for beta={beta:g}: {err}")
 
+    for ax in axes:
         ax.axhline(0, color="k", lw=0.5)
-        ax.set(
-            xlabel=r"$\beta\tau$",
-            ylabel=r"$C_{uu}(\tau)/C_{uu}(0)$",
-            title=fr"$\beta={beta:g}$",
-            xlim=(0, beta * tau_max),
-            ylim=(-0.35, 1.1),
-        )
-        ax.legend(fontsize=8)
+        ax.set(ylim=(-0.35, 1.1))
+        ax.legend(fontsize=8, ncol=1)
+
+    ax_raw.set(
+        xlabel=r"$\tau$",
+        ylabel=r"$C_{uu}(\tau)/C_{uu}(0)$",
+        title="Raw time",
+        xlim=(0, max_raw_tau),
+    )
+    ax_scaled.set(
+        xlabel=r"$\beta\tau$",
+        title="Scaled time",
+        xlim=(0, tau_max),
+    )
 
     plt.suptitle(
-        fr"Phase beta-scaling diagnostic: $\alpha={alpha}$, $g={g_val}$",
+        fr"Phase beta diagnostic: raw vs scaled time, $\alpha={alpha}$, $g={g_val}$",
         fontsize=13, fontweight="bold",
     )
     plt.tight_layout()
@@ -1548,6 +1621,7 @@ def _sim_phase_timeseries(
     dt=0.02,
     n_show=20,
     burn=200.0,
+    synapse_update="exact",
     rng_=None,
 ):
     """Simulate phase network and return raw u timeseries and per-neuron spike times.
@@ -1564,18 +1638,43 @@ def _sim_phase_timeseries(
     W = make_weights(N, sigma, lam=1, rng=rng_)
     phi = rng_.uniform(-np.pi, np.pi, N)
     u = np.zeros(N)
+    synapse_update = str(synapse_update).lower()
+    if synapse_update not in ("exact", "euler"):
+        raise ValueError("synapse_update must be 'exact' or 'euler'")
 
     def F(u_):
         return alpha * np.clip(I + u_, 0.0, 1e12) ** (1.0 / alpha)
 
+    def spike_weights(phi_old, rate, spike_counts):
+        if synapse_update == "euler":
+            return spike_counts
+        weighted = np.zeros_like(spike_counts, dtype=float)
+        spiking = np.flatnonzero(spike_counts > 0)
+        for j in spiking:
+            count = int(spike_counts[j])
+            if count <= 0 or rate[j] <= 0.0:
+                continue
+            thresholds = np.pi + 2.0 * np.pi * np.arange(count)
+            crossing_times = (thresholds - phi_old[j]) / rate[j]
+            crossing_times = np.clip(crossing_times, 0.0, dt)
+            weighted[j] = np.sum(np.exp(-beta * (dt - crossing_times)))
+        return weighted
+
+    def update_u(u_, drive_):
+        if synapse_update == "exact":
+            return np.exp(-beta * dt) * u_ + beta * drive_
+        return u_ + (-beta * u_) * dt + beta * drive_
+
     nb = int(burn / dt)
     for _ in range(nb):
-        phi += F(u) * dt
+        phi_old = phi.copy()
+        rate = F(u)
+        phi = phi_old + rate * dt
         spike_counts = np.floor((phi + np.pi) / (2.0 * np.pi)).astype(float)
         spikes = spike_counts > 0
         phi[spikes] = ((phi[spikes] + np.pi) % (2.0 * np.pi)) - np.pi
-        drive = W @ spike_counts
-        u += -beta * u * dt + beta * drive
+        drive = W @ spike_weights(phi_old, rate, spike_counts)
+        u = update_u(u, drive)
         if not np.all(np.isfinite(u)):
             u = np.nan_to_num(u, nan=0.0, posinf=1e6, neginf=-1e6)
 
@@ -1586,12 +1685,14 @@ def _sim_phase_timeseries(
     spk_times = [[] for _ in range(n_show)]
 
     for step in range(nt):
-        phi += F(u) * dt
+        phi_old = phi.copy()
+        rate = F(u)
+        phi = phi_old + rate * dt
         spike_counts = np.floor((phi + np.pi) / (2.0 * np.pi)).astype(float)
         spikes = spike_counts > 0
         phi[spikes] = ((phi[spikes] + np.pi) % (2.0 * np.pi)) - np.pi
-        drive = W @ spike_counts
-        u += -beta * u * dt + beta * drive
+        drive = W @ spike_weights(phi_old, rate, spike_counts)
+        u = update_u(u, drive)
         if not np.all(np.isfinite(u)):
             u = np.nan_to_num(u, nan=0.0, posinf=1e6, neginf=-1e6)
         U[step] = u[idx]
@@ -1607,6 +1708,16 @@ def _phase_sigma_c(I, alpha):
     rho = 1.0 / (2.0 * np.pi)
     Fprime0 = float(np.maximum(I, 1e-10) ** (1.0 / alpha - 1.0))
     return 1.0 / (rho * Fprime0)
+
+
+def _beta_time_factor(beta):
+    """Simulation-time multiplier for slow synapses.
+
+    The u-filter relaxation time is O(1/beta).  Comparisons at beta < 1 need
+    proportionally longer burn-in and recording windows to estimate the same
+    number of effective correlation times.
+    """
+    return max(1.0, 1.0 / max(float(beta), 1e-12))
 
 
 # -----------------------------------------------------------------------------
@@ -1815,10 +1926,12 @@ def plot_phase_corr_params(
     T=5000.0,
     dt=0.02,
     tau_max=80.0,
+    burn=300.0,
     sim_reps=2,
     plot_dir=None,
     n_jobs=1,
     theory_kwargs=None,
+    scale_slow_beta_time=True,
 ):
     """Sim vs theory C_uu(tau) for different parameter combinations.
 
@@ -1860,11 +1973,14 @@ def plot_phase_corr_params(
     ss = np.random.SeedSequence()
     all_jobs = []
     for ps in param_sets:
+        beta_ps = float(ps["beta"])
+        slow_factor = max(1.0, 1.0 / max(beta_ps, 1e-12)) if scale_slow_beta_time else 1.0
         for _ in range(max(1, sim_reps)):
             seed = int(ss.spawn(1)[0].generate_state(1)[0])
             all_jobs.append(dict(
                 N=N, I=ps["I"], alpha=ps["alpha"], sigma=ps["sigma"],
-                beta=ps["beta"], T=T, dt=dt, tau_max=tau_max, n_probe=N,
+                beta=ps["beta"], T=T * slow_factor, burn=burn * slow_factor,
+                dt=dt, tau_max=tau_max, n_probe=N,
                 seed=seed,
             ))
 
@@ -1939,9 +2055,11 @@ def plot_phase_corr_N(
     T=5000.0,
     dt=0.02,
     tau_max=80.0,
+    burn=300.0,
     plot_dir=None,
     n_jobs=1,
     theory_kwargs=None,
+    scale_slow_beta_time=True,
 ):
     """Sim vs theory C_uu(tau) for different N (finite-size convergence).
 
@@ -1980,12 +2098,14 @@ def plot_phase_corr_N(
     # Build all sim jobs so they can be dispatched in parallel.
     ss = np.random.SeedSequence()
     all_jobs = []
+    slow_factor = max(1.0, 1.0 / max(float(beta), 1e-12)) if scale_slow_beta_time else 1.0
     for sig in sigma_list:
         for N in N_vals:
             seed = int(ss.spawn(1)[0].generate_state(1)[0])
             all_jobs.append(dict(
                 N=N, I=I, alpha=alpha, sigma=sig, beta=beta,
-                T=T, dt=dt, tau_max=tau_max, n_probe=N,
+                T=T * slow_factor, burn=burn * slow_factor,
+                dt=dt, tau_max=tau_max, n_probe=N,
                 seed=seed,
             ))
 
