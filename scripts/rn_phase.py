@@ -1881,12 +1881,36 @@ def _phase_sim_job(kwargs):
     return sim_phase_network(**kwargs, rng=job_rng)
 
 
+def _worker_init(scripts_dir):
+    """Initializer for spawned worker processes.
+
+    Adds the scripts directory to sys.path so that rn_phase and friends are
+    importable, and forces the non-interactive Agg matplotlib backend before
+    any pyplot import can open a display.
+    """
+    import sys, os
+    if scripts_dir not in sys.path:
+        sys.path.insert(0, scripts_dir)
+    os.environ.setdefault("MPLBACKEND", "Agg")
+    try:
+        import matplotlib
+        matplotlib.use("Agg")
+    except Exception:
+        pass
+
+
 def _run_jobs_parallel(jobs, n_jobs):
     """Run a list of job-dicts via _phase_sim_job, returning results in order.
 
     n_jobs=1  → sequential (no extra processes).
     n_jobs>1  → ProcessPoolExecutor with that many workers.
     n_jobs=-1 → use os.cpu_count() workers.
+
+    On macOS, 'fork' is unsafe when NumPy/BLAS has active threads and will
+    cause worker processes to be killed (BrokenProcessPool).  We use 'spawn'
+    on macOS instead; the _worker_init initializer re-adds the scripts path so
+    _phase_sim_job is importable in the fresh child interpreter.  Linux keeps
+    'fork' for speed.  Windows always uses 'spawn' (default).
     """
     import os, sys
     from concurrent.futures import ProcessPoolExecutor
@@ -1895,15 +1919,26 @@ def _run_jobs_parallel(jobs, n_jobs):
         return [_phase_sim_job(dict(j)) for j in jobs]
 
     workers = os.cpu_count() if n_jobs == -1 else int(n_jobs)
-    # Use 'fork' on POSIX so child processes inherit the already-imported
-    # module state without re-executing __main__, avoiding the recursive-spawn
-    # problem that occurs on macOS when the start method is 'spawn'.
-    mp_ctx = None
-    if sys.platform != "win32":
-        import multiprocessing
+    scripts_dir = os.path.dirname(os.path.abspath(__file__))
+
+    import multiprocessing
+    if sys.platform == "darwin":
+        mp_ctx = multiprocessing.get_context("spawn")
+        init, init_args = _worker_init, (scripts_dir,)
+    elif sys.platform != "win32":
         mp_ctx = multiprocessing.get_context("fork")
+        init, init_args = None, ()
+    else:
+        mp_ctx = None  # Windows default (spawn)
+        init, init_args = _worker_init, (scripts_dir,)
+
     try:
-        with ProcessPoolExecutor(max_workers=workers, mp_context=mp_ctx) as ex:
+        with ProcessPoolExecutor(
+            max_workers=workers,
+            mp_context=mp_ctx,
+            initializer=init,
+            initargs=init_args,
+        ) as ex:
             return list(ex.map(_phase_sim_job, [dict(j) for j in jobs]))
     except PermissionError as err:
         print(f"  Parallel workers unavailable ({err}); running sequentially.")
