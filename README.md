@@ -17,7 +17,8 @@ RandomNet/
 │   ├── rn_rate.py             # Rate-network simulation/theory/plots
 │   ├── rn_phase.py            # Phase-network simulation/theory/plots
 │   ├── rn_binary.py           # Binary-neuron simulation/theory/plots
-│   └── make_quick_plots.py    # Small binary/rate plotting script
+│   ├── make_quick_plots.py    # Small binary/rate plotting script
+│   └── make_paper_figures.py  # Curated paper-figure driver
 ├── data/
 │   └── plots/                 # Generated figures
 ├── docs/
@@ -62,6 +63,17 @@ Generate quick binary/rate plots:
 ```bash
 python scripts/make_quick_plots.py
 ```
+
+Generate the curated paper-figure set:
+
+```bash
+python scripts/make_paper_figures.py --profile quick
+python scripts/make_paper_figures.py --profile paper
+```
+
+The paper driver writes consistently named figures and a manifest under
+`data/plots/paper/`.  Use `--figures phase-compare criticality` to regenerate
+only selected panels.
 
 Run the full plotting script:
 
