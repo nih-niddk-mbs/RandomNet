@@ -141,13 +141,9 @@ def theory_phase_autocorr(
     kernel_omega=0.0,
     kernel_damping=0.0,
     kernel_scaled_by_beta=True,
-    fd_max_nfev=250,
-    fd_tail_weight=10.0,
-    fd_kick_weight=5.0,
     q_method="gh",
     n_qmc=2048,
     hermite_order=32,
-    cov_penalty_weight=5.0,
     warn_on_no_branch=True,
 ):
     """
@@ -157,21 +153,11 @@ def theory_phase_autocorr(
     C_11(tau->inf)=0 and C_eq=0. The centered SCS with gain g is directly correct:
     no g_shifted or C_eq machinery needed.
 
-    Several closures are retained because the phase reduction is approximate.
-    In the older shot-kick closure, the singular D_shot delta(tau) term gives
-    the initial velocity C'(0+)=-beta^2 D_shot/2 and the smooth tau>0
-    trajectory is selected by the modified energy condition
+    The filtered shot-noise covariance is treated as a homogeneous contribution
+    that inflates C(0); the smooth ODE is integrated with C'(0)=0.  This is the
+    only active scalar phase closure in the code.
 
-        H(C0) = C0^2 - 2 int_0^C0 Q_smooth(C; C0) dC = beta^2 D_shot(C0)^2 / 4.
-
-    solver="inflated_ic" implements the current
-    interpretation where the filtered shot-noise covariance is a homogeneous
-    contribution that inflates C(0); the smooth ODE is integrated with C'(0)=0.
-    solver="energy" uses the monotone rate-like conserved-energy branch.
-    solver="fd" is retained only as a legacy diagnostic for the retired
-    shot-kick closure and is not used by default plots.
-
-    The finite-difference solver can test a minimal generalized phase kernel,
+    A minimal generalized phase kernel can be included,
 
         L_C C = C'' + 2*kernel_damping*C'
                 + (kernel_omega**2 - beta**2)*C,
@@ -184,9 +170,6 @@ def theory_phase_autocorr(
     default the generalized-kernel parameters are dimensionless multiples of
     beta, so kernel_omega=2 means omega=2*beta and kernel_damping=1 means
     damping=beta.  Set kernel_scaled_by_beta=False to pass raw time units.
-    The fd_* weights are numerical continuation controls for the boundary
-    residuals; oscillatory kernels usually need stronger tail weighting than the
-    monotone SCS branch.
     q_method="gh" uses tensor Gauss-Hermite quadrature for Q_smooth. q_method="qmc"
     uses common-random Sobol Gaussian samples, which is slower but more robust
     for hard rectification and strongly nonlinear gains. q_method="hermite" uses
@@ -258,7 +241,7 @@ def theory_phase_autocorr(
                 coeffs[n + 1] = float(np.dot(w, vals * phi_np1))
                 phi_nm1, phi_n = phi_n, phi_np1
 
-        # Avoid unbounded cache growth during finite-difference least_squares.
+        # Avoid unbounded cache growth during nonlinear solves and scans.
         if len(hermite_cache) > 2048:
             hermite_cache.clear()
         hermite_cache[key] = coeffs
@@ -310,17 +293,6 @@ def theory_phase_autocorr(
     damping_val = float(kernel_damping) * kernel_scale
     C0_hi = max(50.0, 10.0 * sigma ** 4 / (16.0 * np.pi ** 3))
 
-    def energy_balance(C0_val, n_grid=384):
-        C0_val = float(C0_val)
-        if C0_val <= 0.0:
-            return np.nan
-        C_grid = np.linspace(0.0, C0_val, n_grid)
-        Q_grid = np.array([Q_centered(c, C0_val) for c in C_grid])
-        integral_Q = np.trapezoid(Q_grid, C_grid)
-        H0 = C0_val**2 - 2.0 * integral_Q
-        target = 0.25 * beta_val**2 * D_shot(C0_val) ** 2
-        return float(H0 - target)
-
     def smooth_energy(C_val, C0_val, n_grid=384):
         """H(C; C0) = C^2 - 2 int_0^C Q_smooth(x; C0) dx."""
         C_val = float(C_val)
@@ -331,146 +303,12 @@ def theory_phase_autocorr(
         Q_grid = np.array([Q_centered(c, C0_val) for c in C_grid])
         return float(C_val**2 - 2.0 * np.trapezoid(Q_grid, C_grid))
 
-    def solve_c0():
-        if C0 is not None:
-            guess_val = float(C0)
-            if guess_val > 0.0:
-                return guess_val
-
-        lo, hi = 1e-5, C0_hi
-        linear = np.linspace(lo, min(hi, 10.0), 80)
-        log = np.logspace(np.log10(lo), np.log10(hi), 80)
-        candidates = np.unique(np.sort(np.concatenate([linear, log])))
-        values = np.array([energy_balance(c) for c in candidates])
-        finite = np.isfinite(values)
-        candidates, values = candidates[finite], values[finite]
-        if len(candidates) == 0:
-            return 1e-4
-
-        # Prefer the first negative-to-positive crossing; it is the monotone
-        # branch continuously connected to the transition.
-        for i in range(len(candidates) - 1):
-            if values[i] <= 0.0 and values[i + 1] >= 0.0:
-                a, b = float(candidates[i]), float(candidates[i + 1])
-                fa = float(values[i])
-                for _ in range(60):
-                    m = 0.5 * (a + b)
-                    fm = energy_balance(m)
-                    if not np.isfinite(fm) or abs(fm) < 1e-10:
-                        return float(m)
-                    if fa * fm <= 0.0:
-                        b = m
-                    else:
-                        a, fa = m, fm
-                return float(0.5 * (a + b))
-
-        # Superlinear gains can genuinely lose the finite stationary branch.
-        # Returning the closest tiny value is misleading: it looks like a theory
-        # curve but is really the failed zero-amplitude fallback.
-        if alpha < 1.0:
-            if warn_on_no_branch:
-                print(
-                    "  no finite phase-theory amplitude found for alpha<1; "
-                    "Gaussian closure likely has no stationary branch here"
-                )
-            return np.nan
-
-        # If no bracket appears, choose the closest balance point so plotting can
-        # still reveal the mismatch instead of failing hard for benign regimes.
-        return float(candidates[np.argmin(np.abs(values))])
-
     ntau = int(tau_max / dtau)
     tau = np.arange(ntau) * dtau
 
     solver_key = str(solver).lower()
-    C0_val = None if solver_key in ("inflated_ic", "inflated-ic", "inflated") else solve_c0()
-
-    def energy_solution(C0_val):
-        n_grid = max(768, int(350 * max(C0_val, 1.0)))
-        C_grid = np.linspace(0.0, C0_val, n_grid)
-        Q_grid = np.array([Q_centered(c, C0_val) for c in C_grid])
-        integral_Q = np.zeros_like(C_grid)
-        integral_Q[1:] = np.cumsum(
-            0.5 * (Q_grid[1:] + Q_grid[:-1]) * np.diff(C_grid)
-        )
-
-        # The shot-noise kick determines C0 through H(C0)=beta^2 D_shot^2/4.
-        # For tau>0 the conserved-energy branch is still dC/dtau=-beta*sqrt(H(C));
-        # no extra constant is added under the square root.
-        H_grid = np.maximum(C_grid**2 - 2.0 * integral_Q, 1e-14)
-        C_desc = C_grid[::-1]
-        speed = beta_val * np.sqrt(H_grid[::-1])
-        dC = -np.diff(C_desc)
-        seg_speed = 0.5 * (speed[:-1] + speed[1:])
-        tau_desc = np.concatenate(
-            [[0.0], np.cumsum(dC / np.maximum(seg_speed, 1e-14))]
-        )
-        return np.interp(tau, tau_desc, C_desc, left=C0_val, right=0.0)
-
-    def finite_difference_solution(C0_seed):
-        from scipy.optimize import least_squares
-
-        n_fd = int(min(max(ntau, 64), 700))
-        tau_fd = np.linspace(0.0, float(tau[-1] if len(tau) else tau_max), n_fd)
-        h = float(tau_fd[1] - tau_fd[0]) if n_fd > 1 else float(dtau)
-        C_init = np.interp(tau_fd, tau, energy_solution(C0_seed))
-
-        lower = np.full(n_fd, -C0_hi)
-        upper = np.full(n_fd, C0_hi)
-        lower[0] = 1e-8
-
-        def residual(C_vec):
-            C_vec = np.asarray(C_vec, dtype=float)
-            C0_fd = float(max(C_vec[0], 1e-8))
-            Q_vals = np.array([Q_centered(c, C0_fd) for c in C_vec])
-
-            # Interior second-order finite-difference equation:
-            # L_C C = -beta^2 Q_smooth(C; C0), with
-            # L_C = d^2 + 2*damping*d + (omega^2-beta^2).
-            first_deriv = (C_vec[2:] - C_vec[:-2]) / (2.0 * h)
-            interior = (
-                (C_vec[2:] - 2.0 * C_vec[1:-1] + C_vec[:-2]) / h**2
-                + 2.0 * damping_val * first_deriv
-                + (omega_val**2 - beta_val**2) * C_vec[1:-1]
-                + beta_val**2 * Q_vals[1:-1]
-            )
-
-            # One-sided derivative kick at tau=0.
-            left_deriv = (-3.0 * C_vec[0] + 4.0 * C_vec[1] - C_vec[2]) / (2.0 * h)
-            left_bc = left_deriv + 0.5 * beta_val**2 * D_shot(C0_fd)
-
-            # Quiet-tail residuals approximate C(tau->inf)=C'(tau->inf)=0.
-            right_deriv = (3.0 * C_vec[-1] - 4.0 * C_vec[-2] + C_vec[-3]) / (2.0 * h)
-            scale = max(abs(C0_fd), 1.0)
-            cov_violation = np.maximum(np.abs(C_vec[1:]) - C0_fd, 0.0)
-            return np.concatenate(
-                [
-                    interior / scale,
-                    cov_penalty_weight * cov_violation / scale,
-                    np.array(
-                        [
-                            fd_kick_weight * left_bc / (beta_val * scale),
-                            fd_tail_weight * C_vec[-1] / scale,
-                            fd_tail_weight * right_deriv / (beta_val * scale),
-                        ]
-                    ),
-                ]
-            )
-
-        fit = least_squares(
-            residual,
-            C_init,
-            bounds=(lower, upper),
-            loss="soft_l1",
-            f_scale=0.1,
-            max_nfev=int(fd_max_nfev),
-            xtol=1e-5,
-            ftol=1e-5,
-            gtol=1e-5,
-        )
-        if not fit.success:
-            print(f"  finite-difference phase theory did not fully converge: {fit.message}")
-        return np.interp(tau, tau_fd, fit.x)
+    if solver_key not in ("inflated_ic", "inflated-ic", "inflated"):
+        raise ValueError("phase theory supports solver='inflated_ic'")
 
     def solve_inflated_total_c0():
         if C0 is not None:
@@ -493,7 +331,7 @@ def theory_phase_autocorr(
         finite = np.isfinite(values)
         candidates, values = candidates[finite], values[finite]
         if len(candidates) == 0:
-            return solve_c0()
+            return np.nan
 
         for i in range(len(candidates) - 1):
             if values[i] == 0.0:
@@ -550,22 +388,7 @@ def theory_phase_autocorr(
             print(f"  inflated-IC phase theory did not fully converge: {sol.message}")
         return sol.y[0] if sol.y.shape[1] == len(tau) else np.interp(tau, sol.t, sol.y[0])
 
-    if solver_key in ("energy", "monotone"):
-        if not np.isfinite(C0_val):
-            return tau, np.full_like(tau, np.nan, dtype=float), sigma_c
-        if abs(omega_val) > 0.0 or abs(damping_val) > 0.0:
-            raise ValueError("solver='energy' is only valid for kernel_omega=kernel_damping=0")
-        C = energy_solution(C0_val)
-    elif solver_key in ("fd", "finite_difference", "finite-difference"):
-        if not np.isfinite(C0_val):
-            return tau, np.full_like(tau, np.nan, dtype=float), sigma_c
-        C = finite_difference_solution(C0_val)
-    elif solver_key in ("inflated_ic", "inflated-ic", "inflated"):
-        C = inflated_ic_solution()
-    else:
-        raise ValueError("solver must be 'fd', 'energy', or 'inflated_ic'")
-
-    return tau, C, sigma_c
+    return tau, inflated_ic_solution(), sigma_c
 
 
 def shot_noise_correction(tau, sigma, beta, I, alpha, C0_total, n_quad=24):
@@ -1356,9 +1179,7 @@ def plot_phase_network(
     damping_label = float(theory_kwargs.get("kernel_damping", 0.0))
     scaled_label = bool(theory_kwargs.get("kernel_scaled_by_beta", True))
     solver_label = str(theory_kwargs.get("solver", "fd"))
-    theory_label = "2PI shot-kick"
-    if solver_label.lower() in ("inflated_ic", "inflated-ic", "inflated"):
-        theory_label = "2PI inflated IC"
+    theory_label = "2PI inflated IC"
     if abs(omega_label) > 0.0 or abs(damping_label) > 0.0:
         suffix = r"\times\beta" if scaled_label else ""
         theory_label = fr"{theory_label} ($\omega={omega_label:g}{suffix}$, $\gamma={damping_label:g}{suffix}$)"

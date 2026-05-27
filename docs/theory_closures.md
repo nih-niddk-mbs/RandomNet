@@ -29,10 +29,6 @@ Important options:
 - `solver="inflated_ic"`: current default closure where the filtered shot-noise
   covariance is treated as a homogeneous contribution that inflates the initial
   variance and the smooth ODE starts with `C'(0)=0`.
-- `solver="energy"`: monotone rate-like SCS branch.  Valid only when the
-  generalized kernel has no oscillatory terms.
-- `solver="fd"`: retired legacy shot-kick closure.  It is retained only for
-  explicit diagnostics and is not used by default plot scripts.
 - `q_method="gh"`: direct 2-D Gauss-Hermite covariance.
 - `q_method="qmc"`: Sobol Gaussian covariance, useful for rough checks.
 - `q_method="hermite"`: 1-D Hermite-series covariance.  This avoids cancellation

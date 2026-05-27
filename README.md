@@ -12,7 +12,7 @@ measures are summarized in [docs/theory_closures.md](docs/theory_closures.md).
 ```text
 RandomNet/
 ├── scripts/
-│   ├── random_network.py      # Compatibility facade and legacy __main__
+│   ├── random_network.py      # Compatibility facade and command-line examples
 │   ├── rn_core.py             # Shared RNG, weights, autocorrelation helpers
 │   ├── rn_rate.py             # Rate-network simulation/theory/plots
 │   ├── rn_phase.py            # Phase-network simulation/theory/plots
@@ -63,7 +63,7 @@ Generate quick binary/rate plots:
 python scripts/make_quick_plots.py
 ```
 
-Run the full legacy plotting script:
+Run the full plotting script:
 
 ```bash
 python scripts/random_network.py
@@ -74,8 +74,8 @@ All plots should be written under `data/plots/`.
 ## Main Theory Entrypoints
 
 - `rn_rate.theory_rate_autocorr`: rate-network SCS theory.
-- `rn_phase.theory_phase_autocorr`: phase-network closures, including finite-difference,
-  inflated-initial-condition, and Hermite covariance options.
+- `rn_phase.theory_phase_autocorr`: phase-network inflated-initial-condition
+  closure with Hermite covariance options.
 - `rn_phase.phase_operational_criticality`: branch-existence criticality for a selected
   phase closure.
 - `rn_binary.theory_binary_autocorr`: exact linear binary-neuron theory.
