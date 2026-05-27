@@ -10,6 +10,9 @@ from random_network import (
 
 
 PHASE_THEORY_KWARGS = dict(
+    # Current default closure: filtered shot noise inflates C(0), and the
+    # smooth ODE starts with C'(0)=0. The old shot-kick FD closure is retired.
+    solver='inflated_ic',
     # Minimal exploratory oscillatory kernel. These are dimensionless multiples
     # of beta because kernel_scaled_by_beta=True.
     kernel_omega=2.0,
@@ -19,9 +22,6 @@ PHASE_THEORY_KWARGS = dict(
     q_method='hermite',
     n_quad=48,
     hermite_order=32,
-    # Used by solver='fd'; other solvers ignore these controls.
-    fd_max_nfev=140,
-    fd_tail_weight=10.0,
 )
 
 if __name__ == '__main__':

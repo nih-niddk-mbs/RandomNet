@@ -13,6 +13,8 @@ is assumed to be universally correct.
 - A filtered white shot-noise contribution has variance `beta * D_shot / 2`.
 - Quantities named `Q_smooth` or `Q_centered` already include the `sigma^2`
   prefactor when they appear in the `C_uu` equation.
+- For phase closures, `R_smooth(c, C0)` means the centered gain covariance
+  without `sigma^2`, with lag covariance `c` and fixed variance `C0`.
 
 ## Phase Network
 
@@ -24,13 +26,13 @@ theory_phase_autocorr(...)
 
 Important options:
 
+- `solver="inflated_ic"`: current default closure where the filtered shot-noise
+  covariance is treated as a homogeneous contribution that inflates the initial
+  variance and the smooth ODE starts with `C'(0)=0`.
 - `solver="energy"`: monotone rate-like SCS branch.  Valid only when the
   generalized kernel has no oscillatory terms.
-- `solver="fd"`: finite-difference solve of the second-order equation with the
-  shot-noise derivative kick.
-- `solver="inflated_ic"`: alternative closure where the filtered shot-noise
-  covariance inflates the initial variance and the smooth ODE starts with
-  `C'(0)=0`.
+- `solver="fd"`: retired legacy shot-kick closure.  It is retained only for
+  explicit diagnostics and is not used by default plot scripts.
 - `q_method="gh"`: direct 2-D Gauss-Hermite covariance.
 - `q_method="qmc"`: Sobol Gaussian covariance, useful for rough checks.
 - `q_method="hermite"`: 1-D Hermite-series covariance.  This avoids cancellation
@@ -46,15 +48,36 @@ L_C C = -beta^2 * Q_smooth(C; C0)
 where `kernel_omega` and `kernel_damping` are dimensionless multiples of `beta`
 by default.
 
+The scalar `C_uu` closure is a smooth Gaussian reduction.  It averages over the
+phase-density propagator and does not retain the near-threshold advection peaks
+of `C_33(v_T,v_T,tau)` around the phase circle.  Near the smooth-feedback
+threshold, the full `C_33` advection equation can matter and should be treated
+as a separate closure rather than silently folded into the scalar Gaussian
+approximation.
+
 ## Criticality
 
 We now track multiple thresholds:
 
 - `sigma_c_smooth = 1 / (rho * F'(0))`: old smooth-feedback threshold.
+- `sigma_c_shot`: static smooth-feedback threshold renormalized by the
+  shot-noise-dressed drive variance.  It solves
+  `1 = sigma^2 * rho^2 * <F'(u)>_C^2` together with
+  `C = beta * sigma^2 * rho * <F(u)>_C / 2`.
 - `sigma_branch`: operational finite-branch threshold for a chosen closure.
 - `g_branch = sigma_branch / sigma_c_smooth`.
 - A future finite-frequency pole threshold can be added once the full kernel
   `G0^{-1}(iw) - Sigma(iw; C0)` is specified.
+
+The static shot-renormalized threshold is computed by:
+
+```python
+phase_shot_renormalized_criticality(...)
+```
+
+This routine uses adaptive 1-D quadrature by default, rather than Gauss-Hermite,
+because clipping makes `<F'(u)>` discontinuous or singular at threshold for many
+`alpha` values.
 
 The operational finite-branch threshold is estimated by:
 
@@ -62,6 +85,9 @@ The operational finite-branch threshold is estimated by:
 phase_operational_criticality(...)
 plot_phase_operational_criticality(...)
 ```
+
+`plot_phase_operational_criticality(...)` overlays the smooth, shot-renormalized,
+and branch thresholds when available.
 
 For superlinear gain (`alpha < 1`), this branch threshold can occur below the
 smooth-feedback threshold.  Current quick estimates for `I=1`, `beta=1`, and the

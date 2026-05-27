@@ -137,7 +137,7 @@ def theory_phase_autocorr(
     tau_max=50,
     dtau=0.01,
     n_quad=24,
-    solver="fd",
+    solver="inflated_ic",
     kernel_omega=0.0,
     kernel_damping=0.0,
     kernel_scaled_by_beta=True,
@@ -151,25 +151,25 @@ def theory_phase_autocorr(
     warn_on_no_branch=True,
 ):
     """
-    Solve the 2PI SCS equation for the phase neuron network with lambda=1,
-    including the point-process shot-noise kick at tau=0.
+    Solve approximate 2PI closures for the phase neuron network with lambda=1.
 
     With row-sum correction (lambda=1), W@1=0 so E[u_i]=0 exactly, meaning
     C_11(tau->inf)=0 and C_eq=0. The centered SCS with gain g is directly correct:
     no g_shifted or C_eq machinery needed.
 
-    The shot noise enters Q as D_shot delta(tau), which gives the initial
-    velocity C'(0+) = -beta^2 D_shot/2.  The smooth tau>0 trajectory is then
-    selected by the modified energy condition
+    Several closures are retained because the phase reduction is approximate.
+    In the older shot-kick closure, the singular D_shot delta(tau) term gives
+    the initial velocity C'(0+)=-beta^2 D_shot/2 and the smooth tau>0
+    trajectory is selected by the modified energy condition
 
         H(C0) = C0^2 - 2 int_0^C0 Q_smooth(C; C0) dC = beta^2 D_shot(C0)^2 / 4.
 
-    solver="energy" uses the monotone conserved-energy branch and is valid only
-    for the rate-like SCS operator.  solver="fd" solves the second-order equation
-    directly on a finite-difference grid with the shot-noise derivative kick and
-    quiet-tail boundary residuals.  solver="inflated_ic" tests the alternative
-    interpretation where the filtered shot-noise variance only inflates C(0) and
-    the smooth ODE is integrated with C'(0)=0.
+    solver="inflated_ic" implements the current
+    interpretation where the filtered shot-noise covariance is a homogeneous
+    contribution that inflates C(0); the smooth ODE is integrated with C'(0)=0.
+    solver="energy" uses the monotone rate-like conserved-energy branch.
+    solver="fd" is retained only as a legacy diagnostic for the retired
+    shot-kick closure and is not used by default plots.
 
     The finite-difference solver can test a minimal generalized phase kernel,
 
@@ -192,6 +192,9 @@ def theory_phase_autocorr(
     for hard rectification and strongly nonlinear gains. q_method="hermite" uses
     a 1-D Hermite expansion of g(u) and evaluates the centered covariance as a
     series in C(tau)/C(0), avoiding cancellation from subtracting E[g]^2.
+    The smooth Gaussian closure averages over phases and therefore does not
+    retain the near-threshold C33 advection peaks described in the notes.  Those
+    peaks require a richer phase-density closure than this scalar C_uu solver.
     warn_on_no_branch controls whether alpha<1 branch failures are printed; scans
     turn this off to avoid repetitive console noise.
     """
@@ -761,6 +764,137 @@ def phase_shot_fixed_point_map(C_vals, I=1.0, alpha=1.0, sigma=7.0, beta=1.0,
     return out
 
 
+def phase_shot_renormalized_criticality(
+    I=1.0,
+    alpha=1.0,
+    beta=1.0,
+    n_quad=96,
+    C_bounds=(1e-10, 1e4),
+    n_scan=240,
+    integration="quad",
+):
+    """
+    Static smooth-feedback threshold dressed by shot-noise variance.
+
+    This solves the coupled equations from the shot-noise-inflated linear
+    theory:
+
+        1 = sigma_c^2 * rho^2 * <F'(u)>_C^2
+        C = beta * sigma_c^2 * rho * <F(u)>_C / 2
+
+    with u~N(0,C).  The result is a static criterion for the smooth Gaussian
+    closure, not the operational finite-branch threshold of a full nonlinear
+    solve.  Returns a dict so callers can compare it to the old smooth
+    threshold and to branch-existence scans.
+    """
+    from scipy.integrate import quad
+    from scipy.optimize import brentq
+
+    rho_phase = 1.0 / (2.0 * np.pi)
+    integration = str(integration).lower()
+    gh_x, gh_w = np.polynomial.hermite.hermgauss(int(n_quad))
+    gh_w = gh_w / np.sqrt(np.pi)
+    exponent = 1.0 / float(alpha)
+    inv_sqrt_2pi = 1.0 / np.sqrt(2.0 * np.pi)
+
+    def moments(C):
+        C = float(max(C, 0.0))
+        if C <= 0.0:
+            x = max(float(I), 0.0)
+            mean_F = float(alpha) * x ** exponent
+            mean_Fp = x ** (exponent - 1.0) if x > 0.0 else 0.0
+            return mean_F, mean_Fp
+
+        if integration in ("quad", "adaptive"):
+            s = np.sqrt(C)
+            z0 = -float(I) / s
+
+            def normal_pdf(z):
+                return inv_sqrt_2pi * np.exp(-0.5 * z * z)
+
+            def f_integrand(z):
+                x = float(I) + s * z
+                return float(alpha) * x ** exponent * normal_pdf(z)
+
+            def fp_integrand(z):
+                x = float(I) + s * z
+                return x ** (exponent - 1.0) * normal_pdf(z)
+
+            mean_F = quad(f_integrand, z0, np.inf, epsabs=1e-10, epsrel=1e-8, limit=200)[0]
+            mean_Fp = quad(fp_integrand, z0, np.inf, epsabs=1e-10, epsrel=1e-8, limit=200)[0]
+            return float(mean_F), float(mean_Fp)
+
+        u = np.sqrt(2.0 * C) * gh_x
+        x = I + u
+        active = x > 0.0
+        x_pos = np.where(active, x, 1.0)
+        F = np.where(active, float(alpha) * x_pos ** exponent, 0.0)
+        Fp = np.where(active, x_pos ** (exponent - 1.0), 0.0)
+        return float(np.dot(gh_w, F)), float(np.dot(gh_w, Fp))
+
+    def sigma_from_C(C):
+        _mean_F, mean_Fp = moments(C)
+        if mean_Fp <= 0.0 or not np.isfinite(mean_Fp):
+            return np.nan
+        return 1.0 / (rho_phase * mean_Fp)
+
+    def balance(C):
+        mean_F, mean_Fp = moments(C)
+        if mean_Fp <= 0.0 or not np.isfinite(mean_Fp):
+            return np.nan
+        sigma_c = 1.0 / (rho_phase * mean_Fp)
+        shot_var = 0.5 * float(beta) * sigma_c**2 * rho_phase * mean_F
+        return float(C - shot_var)
+
+    lo, hi = map(float, C_bounds)
+    grid = np.unique(
+        np.sort(
+            np.concatenate(
+                [
+                    np.linspace(lo, min(hi, 20.0), max(4, n_scan // 2)),
+                    np.logspace(np.log10(lo), np.log10(hi), max(4, n_scan // 2)),
+                ]
+            )
+        )
+    )
+    vals = np.array([balance(c) for c in grid])
+    finite = np.isfinite(vals)
+    grid, vals = grid[finite], vals[finite]
+
+    roots = []
+    for i in range(len(grid) - 1):
+        if vals[i] == 0.0:
+            roots.append(float(grid[i]))
+        elif vals[i] * vals[i + 1] < 0.0:
+            roots.append(float(brentq(balance, grid[i], grid[i + 1], maxiter=100)))
+
+    if not roots:
+        return dict(
+            sigma_smooth=_phase_sigma_c(I, alpha),
+            sigma_shot=np.nan,
+            g_shot=np.nan,
+            C_shot=np.nan,
+            mean_F=np.nan,
+            mean_Fp=np.nan,
+            roots=[],
+        )
+
+    # Use the smallest positive root, continuously connected to the onset.
+    C_star = float(min(r for r in roots if r > 0.0))
+    mean_F, mean_Fp = moments(C_star)
+    sigma_shot = sigma_from_C(C_star)
+    sigma_smooth = _phase_sigma_c(I, alpha)
+    return dict(
+        sigma_smooth=sigma_smooth,
+        sigma_shot=sigma_shot,
+        g_shot=sigma_shot / sigma_smooth,
+        C_shot=C_star,
+        mean_F=mean_F,
+        mean_Fp=mean_Fp,
+        roots=roots,
+    )
+
+
 def plot_phase_shot_fixed_point_diagnostic(
     I=1.0,
     beta=1.0,
@@ -953,8 +1087,9 @@ def plot_phase_operational_criticality(
     n_scan=36,
     theory_kwargs=None,
     plot_dir=None,
+    show_shot_renormalized=True,
 ):
-    """Plot smooth vs branch-existence criticality for the phase closure."""
+    """Plot smooth, shot-renormalized, and branch-existence criticalities."""
     import os
 
     if plot_dir is None:
@@ -985,8 +1120,21 @@ def plot_phase_operational_criticality(
     g_branch = np.array([r[1]["g_branch"] for r in rows], dtype=float)
     censored = np.array([r[1].get("branch_censored", False) for r in rows], dtype=bool)
 
+    if show_shot_renormalized:
+        shot_rows = [
+            phase_shot_renormalized_criticality(I=I, alpha=a, beta=beta)
+            for a in alphas
+        ]
+        sigma_shot = np.array([r["sigma_shot"] for r in shot_rows], dtype=float)
+        g_shot = np.array([r["g_shot"] for r in shot_rows], dtype=float)
+    else:
+        sigma_shot = g_shot = None
+
     fig, axes = plt.subplots(1, 2, figsize=(11.5, 4.2))
     axes[0].plot(alphas, sigma_smooth, "ko-", lw=1.8, label=r"smooth $\sigma_c$")
+    if sigma_shot is not None:
+        axes[0].plot(alphas, sigma_shot, "ms-", lw=1.8,
+                     label=r"shot-renorm. $\sigma_c$")
     axes[0].plot(alphas[~censored], sigma_branch[~censored], "ro-", lw=1.8, label=r"branch $\sigma_\ast$")
     if np.any(censored):
         axes[0].plot(alphas[censored], sigma_branch[censored], "r^", ms=8,
@@ -996,14 +1144,37 @@ def plot_phase_operational_criticality(
     axes[0].grid(alpha=0.25)
 
     axes[1].plot(alphas[~censored], g_branch[~censored], "bo-", lw=1.8)
+    if g_shot is not None:
+        axes[1].plot(alphas, g_shot, "ms-", lw=1.8,
+                     label=r"shot-renorm.")
     if np.any(censored):
         axes[1].plot(alphas[censored], g_branch[censored], "b^", ms=8)
     axes[1].axhline(1.0, color="k", ls=":", lw=1.2)
     axes[1].set(
         xlabel=r"$\alpha$",
         ylabel=r"$g_\ast=\sigma_\ast/\sigma_c^{\rm smooth}$",
-        ylim=(0, max(1.2, np.nanmax(g_branch) * 1.15 if np.any(np.isfinite(g_branch)) else 1.2)),
+        ylim=(
+            0,
+            max(
+                1.2,
+                np.nanmax(
+                    np.concatenate(
+                        [
+                            g_branch[np.isfinite(g_branch)],
+                            g_shot[np.isfinite(g_shot)] if g_shot is not None else np.array([]),
+                        ]
+                    )
+                )
+                * 1.15
+                if (
+                    np.any(np.isfinite(g_branch))
+                    or (g_shot is not None and np.any(np.isfinite(g_shot)))
+                )
+                else 1.2,
+            ),
+        ),
     )
+    axes[1].legend()
     axes[1].grid(alpha=0.25)
 
     plt.suptitle("Phase operational criticality: finite stationary branch", fontsize=13, fontweight="bold")
@@ -1296,28 +1467,23 @@ def plot_phase_theory_comparison(
     if theory_variants is None:
         theory_variants = [
             dict(
-                label="shot-kick FD",
-                kwargs=dict(solver="fd", n_quad=10, fd_max_nfev=140),
-                style=dict(color="C3", ls="--", lw=2.0),
-            ),
-            dict(
-                label=r"gen. kernel FD ($\omega=2,\gamma=1$)",
-                kwargs=dict(
-                    solver="fd", kernel_omega=2.0, kernel_damping=1.0,
-                    n_quad=10, fd_max_nfev=140,
-                ),
-                style=dict(color="C1", ls="-.", lw=2.0),
-            ),
-            dict(
                 label="inflated IC",
-                kwargs=dict(solver="inflated_ic", n_quad=10),
-                style=dict(color="C2", ls=":", lw=2.2),
+                kwargs=dict(solver="inflated_ic", q_method="hermite", n_quad=48, hermite_order=32),
+                style=dict(color="C2", ls="--", lw=2.2),
             ),
             dict(
                 label=r"inflated IC + gen. kernel",
                 kwargs=dict(
                     solver="inflated_ic", kernel_omega=2.0, kernel_damping=1.0,
-                    n_quad=10,
+                    q_method="hermite", n_quad=48, hermite_order=32,
+                ),
+                style=dict(color="C1", ls="-.", lw=2.0),
+            ),
+            dict(
+                label=r"inflated IC + weak gen.",
+                kwargs=dict(
+                    solver="inflated_ic", kernel_omega=1.0, kernel_damping=0.5,
+                    q_method="hermite", n_quad=48, hermite_order=32,
                 ),
                 style=dict(color="C4", ls=(0, (5, 2)), lw=2.0),
             ),
@@ -1409,23 +1575,23 @@ def plot_phase_theory_examples(
     if theory_variants is None:
         theory_variants = [
             dict(
-                label="shot-kick FD",
-                kwargs=dict(solver="fd", q_method="qmc", n_qmc=1024, fd_max_nfev=120),
-                style=dict(color="C3", ls="--", lw=1.7),
-            ),
-            dict(
-                label=r"gen. FD",
-                kwargs=dict(
-                    solver="fd", kernel_omega=2.0, kernel_damping=1.0,
-                    q_method="qmc", n_qmc=1024, fd_max_nfev=120,
-                ),
-                style=dict(color="C1", ls="-.", lw=1.8),
+                label="inflated IC",
+                kwargs=dict(solver="inflated_ic", q_method="hermite", n_quad=48, hermite_order=32),
+                style=dict(color="C2", ls="--", lw=1.8),
             ),
             dict(
                 label=r"infl. IC + gen.",
                 kwargs=dict(
                     solver="inflated_ic", kernel_omega=2.0, kernel_damping=1.0,
-                    q_method="qmc", n_qmc=1024,
+                    q_method="hermite", n_quad=48, hermite_order=32,
+                ),
+                style=dict(color="C1", ls="-.", lw=1.8),
+            ),
+            dict(
+                label=r"infl. IC + weak gen.",
+                kwargs=dict(
+                    solver="inflated_ic", kernel_omega=1.0, kernel_damping=0.5,
+                    q_method="hermite", n_quad=48, hermite_order=32,
                 ),
                 style=dict(color="C4", ls=(0, (5, 2)), lw=1.8),
             ),
@@ -1507,6 +1673,8 @@ def plot_phase_beta_scaling_diagnostic(
     dtau=0.12,
     tau_max=25.0,
     burn=300.0,
+    min_T=400.0,
+    min_burn=400.0,
     sim_reps=1,
     plot_dir=None,
     theory_kwargs=None,
@@ -1525,13 +1693,13 @@ def plot_phase_beta_scaling_diagnostic(
 
     if theory_kwargs is None:
         theory_kwargs = dict(
-            solver="fd",
+            solver="inflated_ic",
             kernel_omega=2.0,
             kernel_damping=1.0,
             kernel_scaled_by_beta=True,
-            q_method="qmc",
-            n_qmc=1024,
-            fd_max_nfev=140,
+            q_method="hermite",
+            n_quad=48,
+            hermite_order=32,
         )
     else:
         theory_kwargs = dict(theory_kwargs)
@@ -1551,10 +1719,12 @@ def plot_phase_beta_scaling_diagnostic(
         tau_s = None
         slow_factor = _beta_time_factor(beta) if scale_slow_beta_time else 1.0
         raw_tau_max = tau_max / max(float(beta), 1e-12)
+        T_run = max(T * slow_factor, float(min_T))
+        burn_run = max(burn * slow_factor, float(min_burn))
         for _ in range(max(1, int(sim_reps))):
             tau_run, C_run = sim_phase_network(
                 N=N, I=I, alpha=alpha, sigma=sigma, beta=beta,
-                T=T * slow_factor, dt=dt, burn=burn * slow_factor,
+                T=T_run, dt=dt, burn=burn_run,
                 tau_max=raw_tau_max, n_probe=N,
             )
             tau_s = tau_run
