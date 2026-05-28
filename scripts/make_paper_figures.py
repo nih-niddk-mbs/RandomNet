@@ -37,6 +37,8 @@ from random_network import (  # noqa: E402
     plot_phase_beta_scaling_diagnostic,
     plot_phase_operational_criticality,
     plot_phase_raster,
+    plot_phase_subcritical_ringing,
+    plot_phase_transition_ringing_sweep,
     plot_phase_theory_examples,
     plot_phase_theory_comparison,
     plot_rate_network,
@@ -167,7 +169,7 @@ def make_figures(profile: str, figures: set[str], plot_dir: Path, jobs: int) -> 
         _copy_named(plot_dir, "phase_beta_scaling_diagnostic.png", "fig04_phase_beta_scaling.png", manifest)
 
     if "criticality" in figures:
-        print("\n[fig05] phase criticality diagnostics")
+        print("\n[fig10] phase criticality diagnostics")
         plot_phase_operational_criticality(
             alpha_vals=(0.5, 0.75, 1.0, 1.5, 2.0),
             g_bounds=(0.25, 1.8),
@@ -175,7 +177,20 @@ def make_figures(profile: str, figures: set[str], plot_dir: Path, jobs: int) -> 
             theory_kwargs=dict(tau_max=1.0, dtau=0.1, **PHASE_THEORY),
             plot_dir=str(plot_dir),
         )
-        _copy_named(plot_dir, "phase_operational_criticality.png", "fig05_phase_criticality.png", manifest)
+        _copy_named(plot_dir, "phase_operational_criticality.png", "fig10_phase_criticality.png", manifest)
+
+    if "phase-ringing" in figures:
+        print("\n[fig05] phase transition ringing sweep")
+        plot_phase_transition_ringing_sweep(
+            N=128 if quick else 256,
+            T=650.0 if quick else 1400.0,
+            dt=0.02,
+            tau_max=25.0 if quick else 40.0,
+            burn=250.0,
+            n_probe=64 if quick else 128,
+            plot_dir=str(plot_dir),
+        )
+        _copy_named(plot_dir, "phase_transition_ringing_sweep.png", "fig05_phase_transition_ringing.png", manifest)
 
     if "phase-activity" in figures:
         print("\n[fig06] phase activity examples")
@@ -234,6 +249,7 @@ def parse_args() -> argparse.Namespace:
         "phase-theory",
         "phase-compare",
         "phase-beta",
+        "phase-ringing",
         "criticality",
         "phase-activity",
         "binary",
@@ -273,7 +289,7 @@ def main() -> None:
             "phase-theory",
             "phase-compare",
             "phase-beta",
-            "criticality",
+            "phase-ringing",
             "phase-activity",
             "binary",
             "binary-conv",

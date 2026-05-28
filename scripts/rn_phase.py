@@ -419,6 +419,284 @@ def shot_noise_correction(tau, sigma, beta, I, alpha, C0_total, n_quad=24):
     return amplitude * np.exp(-float(beta) * np.abs(tau))
 
 
+def theory_phase_threshold_ringing(
+    I=1.0,
+    alpha=1.0,
+    beta=1.0,
+    sigma=3.0,
+    tau_max=40.0,
+    dtau=0.02,
+    C0_total=None,
+    n_quad=48,
+    n_samples=4096,
+    max_harmonic=None,
+    peak_width=None,
+):
+    """Toy C33 threshold-return ringing theory for the subcritical phase model.
+
+    This is not the scalar Gaussian SCS closure.  It approximates the
+    single-neuron spike-train autocorrelation by averaging a threshold-return
+    delta comb over a Gaussian distribution of quasi-static drives:
+
+        C_ring(tau) ∝ E[F(u)^2 sum_m delta(tau - 2*pi*m/F(u))].
+
+    The delta peaks are plotted with a narrow Gaussian width.  This is meant as
+    a diagnostic of the C33 advection mechanism below/near criticality, where
+    the scalar phase closure intentionally smooths this structure away.
+    """
+    tau = np.arange(0.0, tau_max, dtau)
+    rho = 1.0 / (2.0 * np.pi)
+
+    def F(u):
+        return alpha * np.clip(I + u, 0.0, 1e12) ** (1.0 / alpha)
+
+    if C0_total is None:
+        # Subcritical variance floor from filtered shot noise, solved by a
+        # simple fixed point C = beta*sigma^2*rho*E[F(u)]/2.
+        gh_x, gh_w = np.polynomial.hermite.hermgauss(n_quad)
+
+        def mean_F(C):
+            if C <= 0.0:
+                return float(F(0.0))
+            return float(np.dot(gh_w, F(np.sqrt(2.0 * C) * gh_x)) / np.sqrt(np.pi))
+
+        C = max(1e-12, 0.5 * beta * sigma**2 * rho * float(F(0.0)))
+        for _ in range(100):
+            C_new = max(1e-12, 0.5 * beta * sigma**2 * rho * mean_F(C))
+            if abs(C_new - C) <= 1e-9 * max(1.0, C):
+                C = C_new
+                break
+            C = 0.5 * C + 0.5 * C_new
+        C0_total = C
+
+    try:
+        from scipy.special import ndtri
+
+        p = (np.arange(int(n_samples)) + 0.5) / float(n_samples)
+        z = ndtri(p)
+        weights = np.full_like(z, 1.0 / len(z), dtype=float)
+    except Exception:
+        gh_x, gh_w = np.polynomial.hermite.hermgauss(n_quad)
+        z = np.sqrt(2.0) * gh_x
+        weights = gh_w / np.sqrt(np.pi)
+    u_nodes = np.sqrt(max(float(C0_total), 0.0)) * z
+    rates = F(u_nodes)
+    valid = rates > 1e-12
+    rates = rates[valid]
+    weights = weights[valid]
+
+    if peak_width is None:
+        peak_width = max(5.0 * dtau, 0.12 / max(float(beta), 1e-12))
+    if max_harmonic is None:
+        min_period = 2.0 * np.pi / max(float(np.max(rates)), 1e-12)
+        max_harmonic = int(np.ceil(tau_max / max(min_period, 1e-12))) + 1
+
+    C = np.zeros_like(tau)
+    for w, rate in zip(weights, rates):
+        period = 2.0 * np.pi / rate
+        amp = w * (rho * rate) ** 2
+        for m in range(1, max_harmonic + 1):
+            center = m * period
+            if center > tau_max + 4.0 * peak_width:
+                break
+            C += amp * np.exp(-0.5 * ((tau - center) / peak_width) ** 2)
+
+    # Remove an approximate baseline so the curve is visually comparable to a
+    # centered autocorrelation.  The remaining positive peaks mark returns.
+    if len(C) > 0:
+        tail = C[int(0.7 * len(C)):] if len(C) > 10 else C
+        C = C - float(np.median(tail))
+    return tau, C, float(C0_total)
+
+
+def filter_spike_cov_to_drive(tau, Q_tau, beta=1.0):
+    """Filter an even spike/input covariance through beta exp(-beta t)."""
+    tau = np.asarray(tau, dtype=float)
+    Q_tau = np.asarray(Q_tau, dtype=float)
+    if len(tau) < 3:
+        return np.zeros_like(Q_tau)
+    dt = float(np.median(np.diff(tau)))
+    # Even extension: [0, +tau, ..., reflected positive lags].
+    Q_even = np.concatenate([Q_tau, Q_tau[-2:0:-1]])
+    omega = 2.0 * np.pi * np.fft.fftfreq(len(Q_even), d=dt)
+    C_hat = (float(beta) ** 2) * np.fft.fft(Q_even) / (float(beta) ** 2 + omega**2)
+    return np.real(np.fft.ifft(C_hat))[: len(Q_tau)]
+
+
+def fit_spike_return_comb(tau, Cspk, period_guess=None, max_harmonic=None):
+    """Fit spike autocovariance with a damped Gaussian return comb.
+
+    Model:
+        baseline + amp * sum_m exp(-decay*m*T)
+                     exp[-(tau-m*T)^2/(2*width^2)]
+
+    This is an empirical fit to the threshold-return structure.  It is useful
+    for asking whether the fitted spike covariance, after synaptic filtering,
+    can reproduce C_uu.
+    """
+    from scipy.optimize import curve_fit
+
+    tau = np.asarray(tau, dtype=float)
+    Cspk = np.asarray(Cspk, dtype=float)
+    mask = np.isfinite(tau) & np.isfinite(Cspk) & (tau > 0.0)
+    t = tau[mask]
+    y = Cspk[mask]
+    if len(t) < 20:
+        return np.zeros_like(tau), {}
+
+    # Smooth only for initial guesses; fit uses the raw covariance.
+    dt = float(np.median(np.diff(tau)))
+    y_scale = max(float(np.nanmax(np.abs(y))), 1e-12)
+    y_norm = y / y_scale
+
+    if period_guess is None:
+        # Pick the first prominent positive peak after zero.
+        search = (t > 1.0) & (t < min(float(t[-1]), 12.0))
+        if np.any(search):
+            period_guess = float(t[search][np.argmax(y_norm[search])])
+        else:
+            period_guess = 2.0 * np.pi
+    period_guess = max(float(period_guess), 4.0 * dt)
+
+    if max_harmonic is None:
+        max_harmonic = int(np.ceil(float(t[-1]) / period_guess)) + 2
+
+    def model(tt, amp, period, width, decay, baseline):
+        out = np.full_like(tt, baseline, dtype=float)
+        period = max(period, 4.0 * dt)
+        width = max(width, dt)
+        for m in range(1, max_harmonic + 1):
+            center = m * period
+            if center > float(t[-1]) + 5.0 * width:
+                break
+            out += amp * np.exp(-decay * m) * np.exp(-0.5 * ((tt - center) / width) ** 2)
+        return out
+
+    p0 = [
+        max(float(np.nanmax(y_norm)), 1e-3),
+        period_guess,
+        max(3.0 * dt, 0.20),
+        0.15,
+        float(np.nanmedian(y_norm)),
+    ]
+    bounds = (
+        [0.0, max(4.0 * dt, 0.2 * period_guess), dt, 0.0, -1.0],
+        [5.0, min(float(t[-1]), 2.5 * period_guess), max(2.0, period_guess), 4.0, 1.0],
+    )
+    try:
+        popt, _ = curve_fit(model, t, y_norm, p0=p0, bounds=bounds, maxfev=20000)
+    except Exception:
+        popt = np.array(p0, dtype=float)
+
+    fitted = np.zeros_like(tau, dtype=float)
+    fitted[mask] = y_scale * model(t, *popt)
+    fitted[~mask] = y_scale * model(tau[~mask], *popt) if np.any(~mask) else fitted[~mask]
+    info = dict(
+        amp=float(popt[0] * y_scale),
+        period=float(popt[1]),
+        width=float(popt[2]),
+        decay=float(popt[3]),
+        baseline=float(popt[4] * y_scale),
+    )
+    return fitted, info
+
+
+def _sim_phase_probe_correlations(
+    N=256,
+    I=1.0,
+    alpha=1.0,
+    sigma=3.0,
+    beta=1.0,
+    T=1200.0,
+    dt=0.02,
+    tau_max=30.0,
+    burn=300.0,
+    n_probe=96,
+    job_rng=rng,
+):
+    """Simulate phase network and return per-neuron C_uu and spike autocovariance."""
+    W = make_weights(N, sigma, 1, job_rng)
+    phi = job_rng.uniform(-np.pi, np.pi, N)
+    u = np.zeros(N)
+    n_probe = int(max(1, min(N, n_probe)))
+    probe_idx = np.arange(n_probe)
+
+    def F(u_):
+        return alpha * np.clip(I + u_, 0.0, 1e12) ** (1.0 / alpha)
+
+    def step(phi_, u_):
+        phi_old = phi_.copy()
+        rate = F(u_)
+        phi_new = phi_old + rate * dt
+        spike_counts = np.floor((phi_new + np.pi) / (2.0 * np.pi)).astype(float)
+        spiking = spike_counts > 0
+        phi_new[spiking] = ((phi_new[spiking] + np.pi) % (2.0 * np.pi)) - np.pi
+
+        weighted = np.zeros_like(spike_counts, dtype=float)
+        for j in np.flatnonzero(spiking):
+            count = int(spike_counts[j])
+            if count <= 0 or rate[j] <= 0.0:
+                continue
+            thresholds = np.pi + 2.0 * np.pi * np.arange(count)
+            crossing_times = np.clip((thresholds - phi_old[j]) / rate[j], 0.0, dt)
+            weighted[j] = np.sum(np.exp(-beta * (dt - crossing_times)))
+        u_new = np.exp(-beta * dt) * u_ + beta * (W @ weighted)
+        if not np.all(np.isfinite(u_new)):
+            u_new = np.nan_to_num(u_new, nan=0.0, posinf=1e6, neginf=-1e6)
+        return phi_new, u_new, spike_counts
+
+    for _ in range(int(burn / dt)):
+        phi, u, _ = step(phi, u)
+
+    nt = int(T / dt)
+    max_lag = int(tau_max / dt)
+    U = np.zeros((nt, n_probe))
+    S = np.zeros((nt, n_probe))
+    for k in range(nt):
+        phi, u, spike_counts = step(phi, u)
+        U[k] = u[probe_idx]
+        S[k] = spike_counts[probe_idx] / dt
+
+    Cuu = np.mean([autocorr(U[:, i], max_lag) for i in range(n_probe)], axis=0)
+    Cspk = np.mean([autocorr(S[:, i], max_lag) for i in range(n_probe)], axis=0)
+    tau = np.arange(max_lag) * dt
+    return tau, Cuu, Cspk
+
+
+def infer_Q_from_Cuu(tau, Cuu, beta=1.0, smooth_window=41, polyorder=3):
+    """Infer effective spike-input covariance Q from C''=beta^2(C-Q).
+
+    The derivative is regularized with a Savitzky-Golay filter when SciPy is
+    available.  This is a diagnostic estimate for figures, not a replacement
+    for the microscopic Q closure.
+    """
+    tau = np.asarray(tau, dtype=float)
+    Cuu = np.asarray(Cuu, dtype=float)
+    if len(tau) < 5:
+        return np.zeros_like(Cuu)
+    dt = float(np.median(np.diff(tau)))
+    try:
+        from scipy.signal import savgol_filter
+
+        win = int(smooth_window)
+        win = min(win, len(Cuu) - (1 - len(Cuu) % 2))
+        if win % 2 == 0:
+            win -= 1
+        win = max(win, polyorder + 2 + (polyorder + 2) % 2)
+        if win >= len(Cuu):
+            win = len(Cuu) - 1 if len(Cuu) % 2 == 0 else len(Cuu)
+        if win < polyorder + 2:
+            Cpp = np.gradient(np.gradient(Cuu, dt), dt)
+        else:
+            C_s = savgol_filter(Cuu, win, polyorder, mode="interp")
+            Cpp = savgol_filter(Cuu, win, polyorder, deriv=2, delta=dt, mode="interp")
+            # Keep the original equal-time value but use the smoothed curvature.
+            Cuu = C_s
+    except Exception:
+        Cpp = np.gradient(np.gradient(Cuu, dt), dt)
+    return Cuu - Cpp / max(float(beta) ** 2, 1e-12)
+
+
 def phase_gaussian_gain_covariance(C_tau, C0, I=1.0, alpha=1.0, sigma=1.0,
                                    n_quad=32, q_method="gh", n_qmc=4096,
                                    hermite_order=32):
@@ -953,26 +1231,45 @@ def plot_phase_operational_criticality(
     else:
         sigma_shot = g_shot = None
 
-    fig, axes = plt.subplots(1, 2, figsize=(11.5, 4.2))
-    axes[0].plot(alphas, sigma_smooth, "ko-", lw=1.8, label=r"smooth $\sigma_c$")
+    fig, axes = plt.subplots(1, 2, figsize=(11.8, 4.3))
+    axes[0].plot(
+        alphas, sigma_smooth, "ko-", lw=1.8,
+        label=r"smooth-feedback theory $\sigma_c^{\rm smooth}$",
+    )
     if sigma_shot is not None:
-        axes[0].plot(alphas, sigma_shot, "ms-", lw=1.8,
-                     label=r"shot-renorm. $\sigma_c$")
-    axes[0].plot(alphas[~censored], sigma_branch[~censored], "ro-", lw=1.8, label=r"branch $\sigma_\ast$")
+        axes[0].plot(
+            alphas, sigma_shot, "ms-", lw=1.8,
+            label=r"shot-renormalized theory $\sigma_c^{\rm shot}$",
+        )
+    axes[0].plot(
+        alphas[~censored], sigma_branch[~censored], "ro-", lw=1.8,
+        label=r"scalar branch theory $\sigma_\ast$",
+    )
     if np.any(censored):
         axes[0].plot(alphas[censored], sigma_branch[censored], "r^", ms=8,
-                     label=r"branch $\sigma_\ast$ lower bound")
+                     label=r"scalar branch lower bound")
     axes[0].set(xlabel=r"$\alpha$", ylabel=r"critical $\sigma$")
     axes[0].legend()
     axes[0].grid(alpha=0.25)
 
-    axes[1].plot(alphas[~censored], g_branch[~censored], "bo-", lw=1.8)
+    axes[1].plot(
+        alphas[~censored], g_branch[~censored], "ro-", lw=1.8,
+        label=r"scalar branch theory $g_\ast$",
+    )
     if g_shot is not None:
-        axes[1].plot(alphas, g_shot, "ms-", lw=1.8,
-                     label=r"shot-renorm.")
+        axes[1].plot(
+            alphas, g_shot, "ms-", lw=1.8,
+            label=r"shot-renormalized theory",
+        )
     if np.any(censored):
-        axes[1].plot(alphas[censored], g_branch[censored], "b^", ms=8)
-    axes[1].axhline(1.0, color="k", ls=":", lw=1.2)
+        axes[1].plot(
+            alphas[censored], g_branch[censored], "r^", ms=8,
+            label=r"scalar branch lower bound",
+        )
+    axes[1].axhline(
+        1.0, color="k", ls=":", lw=1.2,
+        label=r"smooth-feedback theory $g=1$",
+    )
     axes[1].set(
         xlabel=r"$\alpha$",
         ylabel=r"$g_\ast=\sigma_\ast/\sigma_c^{\rm smooth}$",
@@ -997,10 +1294,13 @@ def plot_phase_operational_criticality(
             ),
         ),
     )
-    axes[1].legend()
+    axes[1].legend(fontsize=8)
     axes[1].grid(alpha=0.25)
 
-    plt.suptitle("Phase operational criticality: finite stationary branch", fontsize=13, fontweight="bold")
+    plt.suptitle(
+        "Phase criticality: smooth, shot-renormalized, and finite-branch theory",
+        fontsize=13, fontweight="bold",
+    )
     plt.tight_layout()
     outpath = os.path.join(plot_dir, "phase_operational_criticality.png")
     plt.savefig(outpath, dpi=150)
@@ -1146,6 +1446,200 @@ def plot_phase_spike_correlation(
     os.makedirs(plot_dir, exist_ok=True)
     plt.savefig(os.path.join(plot_dir, "phase_spike_correlation_test.png"), dpi=150)
     print(f"Saved to {os.path.join(plot_dir, 'phase_spike_correlation_test.png')}")
+    plt.close("all")
+
+
+def plot_phase_subcritical_ringing(
+    I=1.0,
+    alpha=1.0,
+    beta=1.0,
+    sigma=None,
+    N=256,
+    T=1200.0,
+    dt=0.02,
+    tau_max=30.0,
+    burn=300.0,
+    n_probe=96,
+    plot_dir=None,
+):
+    """Show below-critical threshold-return ringing in per-neuron spike trains.
+
+    The left panel is the per-neuron spike-train autocorrelation, averaged over
+    probe neurons, with a toy C33 threshold-return comb overlaid.  The right
+    panel shows C_uu for the same simulation and the scalar inflated-IC theory.
+    This separates the microscopic phase-density ringing from the smoothed
+    scalar drive closure.
+    """
+    import os
+    if plot_dir is None:
+        plot_dir = os.path.join(os.path.dirname(os.path.abspath(__file__)), "..", "data", "plots")
+    os.makedirs(plot_dir, exist_ok=True)
+
+    sigma_c = _phase_sigma_c(I, alpha)
+    if sigma is None:
+        sigma = 0.55 * sigma_c
+
+    tau, Cuu, Cspk = _sim_phase_probe_correlations(
+        N=N, I=I, alpha=alpha, sigma=sigma, beta=beta,
+        T=T, dt=dt, tau_max=tau_max, burn=burn, n_probe=n_probe,
+    )
+
+    tau_ring, C_ring, C_floor = theory_phase_threshold_ringing(
+        I=I, alpha=alpha, beta=beta, sigma=sigma, tau_max=tau_max, dtau=dt,
+    )
+    tau_th, C_th, _ = theory_phase_autocorr(
+        I=I, alpha=alpha, beta=beta, sigma=sigma,
+        tau_max=tau_max, dtau=max(dt, 0.05),
+        solver="inflated_ic", q_method="hermite", n_quad=48, hermite_order=32,
+        warn_on_no_branch=False,
+    )
+
+    def norm_after_zero(x):
+        if len(x) <= 1:
+            return x
+        scale = np.nanmax(np.abs(x[1:]))
+        return x / scale if scale > 1e-12 else x
+
+    fig, axes = plt.subplots(1, 2, figsize=(11.5, 4.2))
+    axes[0].plot(tau[1:], norm_after_zero(Cspk)[1:], color="C0", lw=1.4,
+                 label="simulation: per-neuron spikes")
+    axes[0].plot(tau_ring[1:], norm_after_zero(C_ring)[1:], color="C3", ls="--", lw=2.0,
+                 label=r"$C_{33}$ threshold-return comb")
+    axes[0].set(
+        xlabel=r"$\tau$",
+        ylabel="normalized spike autocovariance",
+        title=fr"Below critical: $\sigma/\sigma_c={sigma/sigma_c:.2f}$",
+        xlim=(0, tau_max),
+    )
+    axes[0].legend(fontsize=8)
+    axes[0].grid(alpha=0.25)
+
+    Cuu_norm = Cuu / max(abs(Cuu[0]), 1e-12)
+    axes[1].plot(tau, Cuu_norm, color="C0", lw=1.5, label=r"simulation $C_{uu}$")
+    if np.all(np.isfinite(C_th)):
+        axes[1].plot(tau_th, C_th / max(abs(C_th[0]), 1e-12),
+                     color="C2", ls="--", lw=2.0, label="scalar inflated-IC theory")
+    axes[1].set(
+        xlabel=r"$\tau$",
+        ylabel=r"$C_{uu}(\tau)/C_{uu}(0)$",
+        title=fr"Drive covariance; shot floor $C_{{sn}}\approx{C_floor:.2f}$",
+        xlim=(0, tau_max),
+    )
+    axes[1].legend(fontsize=8)
+    axes[1].grid(alpha=0.25)
+
+    plt.suptitle("Phase model below criticality: C33 ringing versus scalar closure",
+                 fontsize=13, fontweight="bold")
+    plt.tight_layout()
+    outpath = os.path.join(plot_dir, "phase_subcritical_ringing.png")
+    plt.savefig(outpath, dpi=150)
+    print(f"Saved to {outpath}")
+    plt.close("all")
+
+
+def plot_phase_transition_ringing_sweep(
+    I=1.0,
+    alpha=1.0,
+    beta=1.0,
+    g_vals=(0.5, 0.8, 1.0, 1.2, 1.5),
+    N=192,
+    T=900.0,
+    dt=0.02,
+    tau_max=25.0,
+    burn=300.0,
+    n_probe=96,
+    plot_dir=None,
+):
+    """Sweep below-to-above criticality using spike autocovariance and C_uu.
+
+    Top row: per-neuron spike-train autocovariance, where the threshold-return
+    C33 ringing should be visible below criticality.  The black dashed curve is
+    Q inferred from the measured drive covariance via C''=beta^2(C-Q), and the
+    red dotted curve is a fitted C33 return comb.
+
+    Bottom row: measured drive covariance and the synaptically filtered fitted
+    spike covariance.
+    """
+    import os
+    if plot_dir is None:
+        plot_dir = os.path.join(os.path.dirname(os.path.abspath(__file__)), "..", "data", "plots")
+    os.makedirs(plot_dir, exist_ok=True)
+
+    sigma_c = _phase_sigma_c(I, alpha)
+    ncols = len(g_vals)
+    fig, axes = plt.subplots(2, ncols, figsize=(3.4 * ncols, 6.2), sharex=True)
+    if ncols == 1:
+        axes = np.array(axes).reshape(2, 1)
+
+    def norm_tail(x):
+        if len(x) <= 1:
+            return x
+        scale = np.nanmax(np.abs(x[1:]))
+        return x / scale if scale > 1e-12 else x
+
+    for col, g_val in enumerate(g_vals):
+        sigma = float(g_val) * sigma_c
+        print(f"  transition sweep: g={g_val:.2f}, sigma={sigma:.3f}")
+        tau_s, Cuu_s, Cspk_s = _sim_phase_probe_correlations(
+            N=N, I=I, alpha=alpha, sigma=sigma, beta=beta,
+            T=T, dt=dt, tau_max=tau_max, burn=burn, n_probe=n_probe,
+            job_rng=np.random.default_rng(1000 + col),
+        )
+
+        Q_inferred = infer_Q_from_Cuu(tau_s, Cuu_s, beta=beta)
+        tau_ring, C_ring_raw, C_floor = theory_phase_threshold_ringing(
+            I=I, alpha=alpha, beta=beta, sigma=sigma,
+            tau_max=tau_max, dtau=dt, n_quad=48,
+        )
+        # Use the C33 comb as a period-informed prior, but fit the actual
+        # simulated spike autocovariance.  This avoids presenting a rough
+        # quadrature comb as a quantitative theory curve.
+        period_guess = 2.0 * np.pi / max(1e-12, alpha * max(I, 1e-12) ** (1.0 / alpha))
+        Cspk_fit, fit_info = fit_spike_return_comb(tau_s, Cspk_s, period_guess=period_guess)
+        Cuu_ring = filter_spike_cov_to_drive(tau_s, sigma**2 * Cspk_fit, beta=beta)
+        Cuu_shot_basis = np.exp(-float(beta) * tau_s)
+        X = np.column_stack([Cuu_shot_basis, Cuu_ring])
+        try:
+            from scipy.optimize import nnls
+
+            coeffs, _ = nnls(X, Cuu_s)
+        except Exception:
+            coeffs, *_ = np.linalg.lstsq(X, Cuu_s, rcond=None)
+        Cuu_from_fit = X @ coeffs
+
+        ax = axes[0, col]
+        ax.plot(tau_s[1:], norm_tail(Cspk_s)[1:], color="C0", lw=1.2, label="sim spikes")
+        ax.plot(tau_s[1:], norm_tail(Q_inferred)[1:],
+                color="k", ls="--", lw=1.4, label=r"inferred $Q=C-C''/\beta^2$")
+        ax.plot(tau_s[1:], norm_tail(Cspk_fit)[1:],
+                color="C3", ls=":", lw=1.8, label=r"fitted $C_{33}$ comb")
+        ax.axhline(0, color="0.2", lw=0.5)
+        ax.set_title(fr"$g=\sigma/\sigma_c={g_val:.1f}$")
+        ax.set_xlim(0, tau_max)
+        ax.set_ylim(-0.45, 1.05)
+        if col == 0:
+            ax.set_ylabel("spike autocov.")
+            ax.legend(fontsize=7)
+
+        ax = axes[1, col]
+        ax.plot(tau_s, Cuu_s / max(abs(Cuu_s[0]), 1e-12),
+                color="C0", lw=1.2, label=r"sim $C_{uu}$")
+        if np.nanmax(np.abs(Cuu_from_fit)) > 1e-12:
+            ax.plot(tau_s, Cuu_from_fit / max(abs(Cuu_from_fit[0]), 1e-12),
+                    color="C3", ls=":", lw=1.8, label=r"shot + filtered comb")
+        ax.axhline(0, color="0.2", lw=0.5)
+        ax.set_xlabel(r"$\tau$")
+        ax.set_ylim(-0.45, 1.05)
+        if col == 0:
+            ax.set_ylabel(r"$C_{uu}/C_{uu}(0)$")
+            ax.legend(fontsize=7)
+
+    plt.suptitle("Phase transition sweep: fitted spike Q and Cuu prediction",
+                 fontsize=13, fontweight="bold")
+    plt.tight_layout()
+    outpath = os.path.join(plot_dir, "phase_transition_ringing_sweep.png")
+    plt.savefig(outpath, dpi=150)
+    print(f"Saved to {outpath}")
     plt.close("all")
 
 
