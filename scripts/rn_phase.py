@@ -2107,6 +2107,7 @@ def _sim_phase_timeseries(
     n_show=20,
     burn=200.0,
     synapse_update="exact",
+    max_recorded_spikes_per_bin=None,
     rng_=None,
 ):
     """Simulate phase network and return raw u timeseries and per-neuron spike times.
@@ -2184,6 +2185,8 @@ def _sim_phase_timeseries(
         for k in range(n_show):
             count = int(spike_counts[idx[k]])
             if count:
+                if max_recorded_spikes_per_bin is not None:
+                    count = min(count, int(max_recorded_spikes_per_bin))
                 spk_times[k].extend([t[step]] * count)
 
     return t, U, [np.array(st) for st in spk_times]
@@ -2219,6 +2222,8 @@ def plot_u_timeseries(
     dt=0.02,
     n_show=8,
     burn=100.0,
+    synapse_update="exact",
+    max_recorded_spikes_per_bin=1,
     plot_dir=None,
 ):
     """Plot u(t) traces for several neurons across sigma values.
@@ -2245,6 +2250,8 @@ def plot_u_timeseries(
         t, U, _ = _sim_phase_timeseries(
             N=N, I=I, alpha=alpha, sigma=sigma, beta=beta,
             T=T, dt=dt, n_show=n_show, burn=burn,
+            synapse_update=synapse_update,
+            max_recorded_spikes_per_bin=max_recorded_spikes_per_bin,
         )
         for k in range(n_show):
             ax.plot(t, U[:, k], lw=0.8, alpha=0.7)
@@ -2278,6 +2285,8 @@ def plot_phase_raster(
     T=500.0,
     dt=0.02,
     burn=100.0,
+    synapse_update="exact",
+    max_recorded_spikes_per_bin=1,
     plot_dir=None,
 ):
     """Spike raster (neuron index vs time) + population rate for several sigma.
@@ -2307,6 +2316,8 @@ def plot_phase_raster(
         t, _, spk_times = _sim_phase_timeseries(
             N=N, I=I, alpha=alpha, sigma=sigma, beta=beta,
             T=T, dt=dt, n_show=N, burn=burn,
+            synapse_update=synapse_update,
+            max_recorded_spikes_per_bin=max_recorded_spikes_per_bin,
         )
         ax_raster = axes[0, col]
         ax_rate   = axes[1, col]

@@ -197,9 +197,21 @@ def make_figures(profile: str, figures: set[str], plot_dir: Path, jobs: int) -> 
         print("\n[fig06] phase activity examples")
         activity_N = 96 if quick else 192
         activity_T = 150.0 if quick else 300.0
-        plot_u_timeseries(N=activity_N, T=activity_T, burn=150.0, plot_dir=str(plot_dir))
+        plot_u_timeseries(
+            N=activity_N,
+            T=activity_T,
+            burn=150.0,
+            synapse_update="euler",
+            plot_dir=str(plot_dir),
+        )
         _copy_named(plot_dir, "phase_u_timeseries.png", "fig06a_phase_u_timeseries.png", manifest)
-        plot_phase_raster(N=activity_N, T=activity_T, burn=150.0, plot_dir=str(plot_dir))
+        plot_phase_raster(
+            N=activity_N,
+            T=activity_T,
+            burn=150.0,
+            synapse_update="euler",
+            plot_dir=str(plot_dir),
+        )
         _copy_named(plot_dir, "phase_raster.png", "fig06b_phase_raster.png", manifest)
 
     if "binary" in figures:
@@ -291,6 +303,7 @@ def main() -> None:
             "phase-compare",
             "phase-beta",
             "phase-ringing",
+            "criticality",
             "phase-activity",
             "binary",
             "binary-conv",
