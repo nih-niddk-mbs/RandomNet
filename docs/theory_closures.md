@@ -123,6 +123,9 @@ plot_phase_operational_criticality(...)
 plot_clipped_vs_linear(...)
 ```
 
-All generated figures should be written to `data/plots/`.
+Generated figures and simulation caches should be written outside the
+repository, by default under
+`~/Library/CloudStorage/OneDrive-NationalInstitutesofHealth/randomnet/`.
+Set `RANDOMNET_RESULTS_DIR` to override the destination.
 
 `scripts/random_network.py` re-exports the split modules for older scripts.

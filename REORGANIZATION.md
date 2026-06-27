@@ -2,6 +2,12 @@
 
 **Date**: May 21, 2026
 
+**Update, June 27, 2026**: Generated figures and simulation caches now live
+outside the repository in the configured RandomNet results directory, defaulting
+to `~/Library/CloudStorage/OneDrive-NationalInstitutesofHealth/randomnet/`.
+The older `data/plots/` references below describe the historical
+reorganization, not the current output policy.
+
 ## Summary of Changes
 
 ### Directory Structure

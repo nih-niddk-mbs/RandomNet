@@ -1,7 +1,7 @@
 #!/usr/bin/env python
 """
 Generate phase model simulation vs theory comparisons.
-All outputs saved to data/plots/
+All outputs are saved to the configured RandomNet results folder.
 """
 
 import sys
@@ -10,6 +10,7 @@ import numpy as np
 sys.path.insert(0, 'scripts')
 
 from random_network import (
+    default_results_dir,
     plot_phase_spike_correlation,
     plot_phase_network,
     plot_u_timeseries,
@@ -20,7 +21,7 @@ from random_network import (
 )
 
 # Consistent output directory
-plot_dir = os.path.join(os.getcwd(), 'data', 'plots')
+plot_dir = default_results_dir()
 os.makedirs(plot_dir, exist_ok=True)
 
 print('='*70)
@@ -93,5 +94,5 @@ plot_phase_network(
 print('   ✓ Complete\n')
 
 print('='*70)
-print('All plots saved to data/plots/')
+print(f'All plots saved to {plot_dir}')
 print('='*70)

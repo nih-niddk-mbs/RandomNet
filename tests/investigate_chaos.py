@@ -5,7 +5,8 @@ Check phase synchronization, order parameters, and distribution properties.
 """
 import numpy as np
 import matplotlib.pyplot as plt
-from python.simulations.random_network import sim_phase_network
+from pathlib import Path
+from python.simulations.random_network import default_results_dir, sim_phase_network
 
 I, alpha, beta = 1.0, 1.0, 1.0
 sigma_c = 2 * np.pi
@@ -119,5 +120,7 @@ for i_sig, sigma in enumerate(sigma_values):
                facecolor='wheat', alpha=0.5))
 
 plt.tight_layout()
-plt.savefig('python/plots/chaotic_dynamics_detail.png', dpi=120, bbox_inches='tight')
-print("\n✓ Saved chaotic_dynamics_detail.png")
+outpath = Path(default_results_dir("diagnostics")) / "chaotic_dynamics_detail.png"
+outpath.parent.mkdir(parents=True, exist_ok=True)
+plt.savefig(outpath, dpi=120, bbox_inches='tight')
+print(f"\n✓ Saved {outpath}")

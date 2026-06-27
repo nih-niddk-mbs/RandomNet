@@ -1,6 +1,6 @@
 """Generate a curated first-pass figure set for the RandomNet paper.
 
-The script writes to data/plots/paper by default.  It intentionally uses the
+The script writes to the configured RandomNet results folder by default. It intentionally uses the
 active theory paths only:
 
   * rate SCS
@@ -31,6 +31,7 @@ if str(SCRIPTS) not in sys.path:
     sys.path.insert(0, str(SCRIPTS))
 
 from random_network import (  # noqa: E402
+    default_results_dir,
     plot_binary_network,
     plot_binary_network_N_convergence,
     plot_clipped_vs_linear,
@@ -272,7 +273,7 @@ def parse_args() -> argparse.Namespace:
     )
     parser.add_argument(
         "--plot-dir",
-        default=str(ROOT / "data" / "plots" / "paper"),
+        default=default_results_dir("paper"),
         help="Output directory.",
     )
     parser.add_argument("--jobs", type=int, default=4, help="Parallel jobs for phase simulation helpers.")

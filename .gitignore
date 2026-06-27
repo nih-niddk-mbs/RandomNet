@@ -25,5 +25,11 @@ env/
 .ipynb_checkpoints/
 
 # Data and results
+data/plots/
 data/results/*.npz
 data/results/*.npy
+plots/
+python/plots/
+*.png
+*.npy
+*.npz

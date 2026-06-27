@@ -2,7 +2,8 @@
 """Test with longer simulations and larger timestep."""
 import numpy as np
 import matplotlib.pyplot as plt
-from python.simulations.random_network import sim_phase_network, theory_phase_autocorr
+from pathlib import Path
+from python.simulations.random_network import default_results_dir, sim_phase_network, theory_phase_autocorr
 
 dt_values = [0.01, 0.02, 0.05]
 I = 1.0
@@ -53,5 +54,7 @@ for idx, dt in enumerate(dt_values):
     ax.set_xlim([0, min(10, tau_sim[-1])])
 
 plt.tight_layout()
-plt.savefig('test_timestep_convergence.png', dpi=150)
-print("✓ Saved test_timestep_convergence.png")
+outpath = Path(default_results_dir("diagnostics")) / "test_timestep_convergence.png"
+outpath.parent.mkdir(parents=True, exist_ok=True)
+plt.savefig(outpath, dpi=150)
+print(f"✓ Saved {outpath}")

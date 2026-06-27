@@ -5,7 +5,7 @@ import os
 import numpy as np
 import matplotlib.pyplot as plt
 
-from rn_core import autocorr, make_weights, rng
+from rn_core import autocorr, default_results_dir, make_weights, rng
 
 # -----------------------------------------------------------------------------
 # 1b. PHASE NEURON NETWORK
@@ -772,7 +772,7 @@ def plot_phase_nonlinear_closure_diagnostic(
     import os
 
     if plot_dir is None:
-        plot_dir = os.path.join(os.path.dirname(os.path.abspath(__file__)), "..", "data", "plots")
+        plot_dir = default_results_dir()
     os.makedirs(plot_dir, exist_ok=True)
 
     if examples is None:
@@ -1015,7 +1015,7 @@ def plot_phase_shot_fixed_point_diagnostic(
     import os
 
     if plot_dir is None:
-        plot_dir = os.path.join(os.path.dirname(os.path.abspath(__file__)), "..", "data", "plots")
+        plot_dir = default_results_dir()
     os.makedirs(plot_dir, exist_ok=True)
 
     C_vals = np.linspace(C_min, C_max, n_C)
@@ -1194,7 +1194,7 @@ def plot_phase_operational_criticality(
     import os
 
     if plot_dir is None:
-        plot_dir = os.path.join(os.path.dirname(os.path.abspath(__file__)), "..", "data", "plots")
+        plot_dir = default_results_dir()
     os.makedirs(plot_dir, exist_ok=True)
 
     rows = []
@@ -1388,7 +1388,7 @@ def plot_phase_spike_correlation(
     """Compare phase-model spike autocorrelation from simulation and theory."""
     import os
     if plot_dir is None:
-        plot_dir = os.path.join(os.path.dirname(os.path.abspath(__file__)), "..", "data", "plots")
+        plot_dir = default_results_dir()
     os.makedirs(plot_dir, exist_ok=True)
     _, _, sigma_c = theory_phase_autocorr(
         I=I,
@@ -1472,7 +1472,7 @@ def plot_phase_subcritical_ringing(
     """
     import os
     if plot_dir is None:
-        plot_dir = os.path.join(os.path.dirname(os.path.abspath(__file__)), "..", "data", "plots")
+        plot_dir = default_results_dir()
     os.makedirs(plot_dir, exist_ok=True)
 
     sigma_c = _phase_sigma_c(I, alpha)
@@ -1562,7 +1562,7 @@ def plot_phase_transition_ringing_sweep(
     """
     import os
     if plot_dir is None:
-        plot_dir = os.path.join(os.path.dirname(os.path.abspath(__file__)), "..", "data", "plots")
+        plot_dir = default_results_dir()
     os.makedirs(plot_dir, exist_ok=True)
 
     sigma_c = _phase_sigma_c(I, alpha)
@@ -1662,7 +1662,7 @@ def plot_phase_network(
     """Compare phase-network simulation and reduced-theory autocorrelations."""
     import os
     if plot_dir is None:
-        plot_dir = os.path.join(os.path.dirname(os.path.abspath(__file__)), "..", "data", "plots")
+        plot_dir = default_results_dir()
     os.makedirs(plot_dir, exist_ok=True)
     rho = 1.0 / (2.0 * np.pi)
     Fprime0 = float(np.maximum(I, 1e-10) ** (1.0 / alpha - 1.0))
@@ -1772,7 +1772,7 @@ def plot_phase_theory_comparison(
     import os
 
     if plot_dir is None:
-        plot_dir = os.path.join(os.path.dirname(os.path.abspath(__file__)), "..", "data", "plots")
+        plot_dir = default_results_dir()
     os.makedirs(plot_dir, exist_ok=True)
 
     sigma_c = _phase_sigma_c(I, alpha)
@@ -1868,7 +1868,7 @@ def plot_phase_theory_examples(
     import os
 
     if plot_dir is None:
-        plot_dir = os.path.join(os.path.dirname(os.path.abspath(__file__)), "..", "data", "plots")
+        plot_dir = default_results_dir()
     os.makedirs(plot_dir, exist_ok=True)
 
     if examples is None:
@@ -2003,7 +2003,7 @@ def plot_phase_beta_scaling_diagnostic(
     import os
 
     if plot_dir is None:
-        plot_dir = os.path.join(os.path.dirname(os.path.abspath(__file__)), "..", "data", "plots")
+        plot_dir = default_results_dir()
     os.makedirs(plot_dir, exist_ok=True)
 
     if theory_kwargs is None:
@@ -2227,7 +2227,7 @@ def plot_u_timeseries(
     """
     import os
     if plot_dir is None:
-        plot_dir = os.path.join(os.path.dirname(os.path.abspath(__file__)), "..", "data", "plots")
+        plot_dir = default_results_dir()
     os.makedirs(plot_dir, exist_ok=True)
 
     sigma_c = _phase_sigma_c(I, alpha)
@@ -2286,7 +2286,7 @@ def plot_phase_raster(
     """
     import os
     if plot_dir is None:
-        plot_dir = os.path.join(os.path.dirname(os.path.abspath(__file__)), "..", "data", "plots")
+        plot_dir = default_results_dir()
     os.makedirs(plot_dir, exist_ok=True)
 
     sigma_c = _phase_sigma_c(I, alpha)
@@ -2460,7 +2460,7 @@ def plot_phase_corr_params(
     """
     import os
     if plot_dir is None:
-        plot_dir = os.path.join(os.path.dirname(os.path.abspath(__file__)), "..", "data", "plots")
+        plot_dir = default_results_dir()
     os.makedirs(plot_dir, exist_ok=True)
     theory_kwargs = {} if theory_kwargs is None else dict(theory_kwargs)
 
@@ -2588,7 +2588,7 @@ def plot_phase_corr_N(
     """
     import os
     if plot_dir is None:
-        plot_dir = os.path.join(os.path.dirname(os.path.abspath(__file__)), "..", "data", "plots")
+        plot_dir = default_results_dir()
     os.makedirs(plot_dir, exist_ok=True)
     theory_kwargs = {} if theory_kwargs is None else dict(theory_kwargs)
 

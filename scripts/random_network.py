@@ -22,8 +22,7 @@ from rn_phase import _phase_sigma_c  # noqa: F401
 if __name__ == "__main__":
     import os
 
-    script_dir = os.path.dirname(os.path.abspath(__file__))
-    plot_dir = os.path.join(script_dir, "..", "data", "plots")
+    plot_dir = default_results_dir()
     os.makedirs(plot_dir, exist_ok=True)
     print(f"Saving plots to: {plot_dir}")
 

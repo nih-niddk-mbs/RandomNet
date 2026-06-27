@@ -19,8 +19,6 @@ RandomNet/
 │   ├── rn_binary.py           # Binary-neuron simulation/theory/plots
 │   ├── make_quick_plots.py    # Small binary/rate plotting script
 │   └── make_paper_figures.py  # Curated paper-figure driver
-├── data/
-│   └── plots/                 # Generated figures
 ├── docs/
 │   └── theory_closures.md     # Notes on closures and criticality
 ├── tests/                     # Development diagnostics
@@ -72,8 +70,8 @@ python scripts/make_paper_figures.py --profile paper
 ```
 
 The paper driver writes consistently named figures and a manifest under
-`data/plots/paper/`.  Use `--figures phase-compare criticality` to regenerate
-only selected panels.
+the external results folder's `paper/` subdirectory. Use
+`--figures phase-compare criticality` to regenerate only selected panels.
 
 Run the full plotting script:
 
@@ -81,7 +79,15 @@ Run the full plotting script:
 python scripts/random_network.py
 ```
 
-All plots should be written under `data/plots/`.
+Generated plots and simulation caches are written outside the repository by
+default:
+
+```text
+~/Library/CloudStorage/OneDrive-NationalInstitutesofHealth/randomnet/
+```
+
+Set `RANDOMNET_RESULTS_DIR=/path/to/results` to override this location. Only
+code and documentation should live in the repository.
 
 ## Main Theory Entrypoints
 

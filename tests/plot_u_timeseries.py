@@ -2,7 +2,8 @@
 """Plot time series of u(t) from phase network simulation."""
 import numpy as np
 import matplotlib.pyplot as plt
-from python.simulations.random_network import sim_phase_network
+from pathlib import Path
+from python.simulations.random_network import default_results_dir, sim_phase_network
 
 # Run simulation
 N = 100
@@ -88,8 +89,10 @@ ax.legend(fontsize=9)
 ax.grid(True, alpha=0.3)
 
 plt.tight_layout()
-plt.savefig('u_timeseries.png', dpi=150)
-print("Saved: u_timeseries.png")
+outpath = Path(default_results_dir("diagnostics")) / "u_timeseries.png"
+outpath.parent.mkdir(parents=True, exist_ok=True)
+plt.savefig(outpath, dpi=150)
+print(f"Saved: {outpath}")
 plt.show()
 
 # Print statistics

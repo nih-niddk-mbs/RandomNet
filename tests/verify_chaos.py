@@ -2,7 +2,8 @@
 """Check if network exhibits chaotic dynamics (sensitivity to initial conditions)."""
 import numpy as np
 import matplotlib.pyplot as plt
-from python.simulations.random_network import sim_phase_network
+from pathlib import Path
+from python.simulations.random_network import default_results_dir, sim_phase_network
 
 I, alpha, beta = 1.0, 1.0, 1.0
 sigma_c = 2 * np.pi
@@ -133,5 +134,7 @@ if nt > dt_map:
     axes[1, 1].grid(True, alpha=0.3)
 
 plt.tight_layout()
-plt.savefig('chaos_verification.png', dpi=150)
-print("✓ Saved chaos_verification.png")
+outpath = Path(default_results_dir("diagnostics")) / "chaos_verification.png"
+outpath.parent.mkdir(parents=True, exist_ok=True)
+plt.savefig(outpath, dpi=150)
+print(f"✓ Saved {outpath}")

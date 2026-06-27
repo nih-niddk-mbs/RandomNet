@@ -2,8 +2,9 @@
 """Quick plots comparing sim vs theory for phase model with centered gain fix."""
 import numpy as np
 import matplotlib.pyplot as plt
+from pathlib import Path
 from python.simulations.random_network import (
-    sim_phase_network, theory_phase_autocorr
+    default_results_dir, sim_phase_network, theory_phase_autocorr
 )
 
 # Two cases: below and near critical
@@ -33,5 +34,7 @@ for idx, sigma in enumerate([0.5*2*np.pi, 1.0*2*np.pi]):
     ax.grid(True, alpha=0.3)
 
 plt.tight_layout()
-plt.savefig('python/plots/phase_sim_vs_theory.png', dpi=120, bbox_inches='tight')
-print("✓ Saved phase_sim_vs_theory.png")
+outpath = Path(default_results_dir("diagnostics")) / "phase_sim_vs_theory.png"
+outpath.parent.mkdir(parents=True, exist_ok=True)
+plt.savefig(outpath, dpi=120, bbox_inches='tight')
+print(f"✓ Saved {outpath}")

@@ -6,7 +6,7 @@ import numpy as np
 from numpy.fft import fft, fftfreq
 import matplotlib.pyplot as plt
 
-from rn_core import autocorr, make_weights, rng
+from rn_core import autocorr, default_results_dir, make_weights, rng
 
 # -----------------------------------------------------------------------------
 # 1. RATE NEURON NETWORK
@@ -198,7 +198,7 @@ def plot_rate_network(sigma=1.5, N=512, C0_guess=0.8, plot_dir=None):
     """Compare simulation vs theory for rate network."""
     import os
     if plot_dir is None:
-        plot_dir = os.path.join(os.path.dirname(os.path.abspath(__file__)), "..", "data", "plots")
+        plot_dir = default_results_dir()
     os.makedirs(plot_dir, exist_ok=True)
     print(f"Simulating rate network: N={N}, sigma={sigma} ...")
     tau_sim, C_sim = sim_rate_network(N=N, sigma=sigma)

@@ -11,7 +11,9 @@ and finite (chaotic) above σ_c.
 """
 import numpy as np
 import matplotlib.pyplot as plt
+from pathlib import Path
 from python.simulations.random_network import (
+    default_results_dir,
     sim_phase_network,
     theory_phase_spike_autocorr,
 )
@@ -135,8 +137,10 @@ plt.suptitle(
     fontweight="bold",
 )
 plt.tight_layout()
-plt.savefig("cspk_chaos_transition.png", dpi=150)
-print("Saved: cspk_chaos_transition.png")
+outpath = Path(default_results_dir("diagnostics")) / "cspk_chaos_transition.png"
+outpath.parent.mkdir(parents=True, exist_ok=True)
+plt.savefig(outpath, dpi=150)
+print(f"Saved: {outpath}")
 plt.show()
 
 # Plot 2: Overlay normalized curves with different σ
@@ -167,8 +171,10 @@ ax.grid(True, alpha=0.3, which="both")
 ax.set_xlim(0, 50)
 ax.legend(fontsize=10, loc="upper right")
 plt.tight_layout()
-plt.savefig("cspk_logscale_overlay.png", dpi=150)
-print("Saved: cspk_logscale_overlay.png")
+outpath = Path(default_results_dir("diagnostics")) / "cspk_logscale_overlay.png"
+outpath.parent.mkdir(parents=True, exist_ok=True)
+plt.savefig(outpath, dpi=150)
+print(f"Saved: {outpath}")
 plt.show()
 
 # Print timescale measurements

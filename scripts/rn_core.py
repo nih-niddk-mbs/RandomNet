@@ -1,9 +1,20 @@
 """Shared helpers for RandomNet simulations."""
 
+import os
+from pathlib import Path
+
 import numpy as np
 from numpy.fft import fft, ifft
 
 rng = np.random.default_rng(42)
+
+
+def default_results_dir(*parts):
+    """Return the default external results directory."""
+    root = os.environ.get("RANDOMNET_RESULTS_DIR")
+    if root is None:
+        root = Path.home() / "Library" / "CloudStorage" / "OneDrive-NationalInstitutesofHealth" / "randomnet"
+    return str(Path(root, *parts))
 
 def autocorr(x, max_lag):
     """Unbiased autocorrelation via FFT, normalised so C(0)=variance."""
@@ -24,8 +35,11 @@ def make_weights(N, sigma, lam=1, rng=rng):
     W = rng.normal(0, sigma / np.sqrt(N), (N, N))
     np.fill_diagonal(W, 0)          # zero diagonal first
     if lam:
-        # Correct off-diagonal row sums to zero (N-1 terms per row)
+        if N <= 1:
+            return W
+        # Correct only off-diagonal entries so the zero diagonal is preserved
+        # while each row sum is exactly removed.
+        offdiag = ~np.eye(N, dtype=bool)
         row_sums = W.sum(axis=1, keepdims=True)
-        W -= row_sums / (N - 1)
-        np.fill_diagonal(W, 0)      # re-zero diagonal (it absorbed -correction)
+        W[offdiag] -= np.repeat(row_sums / (N - 1), N, axis=1)[offdiag]
     return W

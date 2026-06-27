@@ -6,7 +6,7 @@ import numpy as np
 from numpy.fft import fft, ifft, fftfreq
 import matplotlib.pyplot as plt
 
-from rn_core import autocorr, make_weights, rng
+from rn_core import autocorr, default_results_dir, make_weights, rng
 
 # -----------------------------------------------------------------------------
 # 2. BINARY NEURON NETWORK
@@ -727,7 +727,7 @@ def plot_clipped_vs_linear(
     """Compare clipped simulation with several clipped-vs-linear theory predictions."""
     import os
     if plot_dir is None:
-        plot_dir = os.path.join(os.path.dirname(os.path.abspath(__file__)), "..", "data", "plots")
+        plot_dir = default_results_dir()
     os.makedirs(plot_dir, exist_ok=True)
     cached = {}
     cache_updated = False
@@ -886,7 +886,7 @@ def plot_binary_network(
     """
     import os
     if plot_dir is None:
-        plot_dir = os.path.join(os.path.dirname(os.path.abspath(__file__)), "..", "data", "plots")
+        plot_dir = default_results_dir()
     os.makedirs(plot_dir, exist_ok=True)
     fig, axes = plt.subplots(2, len(sigma_vals), figsize=(5 * len(sigma_vals), 8))
     if len(sigma_vals) == 1:
@@ -990,7 +990,7 @@ def plot_two_timescale_fit(
     """
     import os
     if plot_dir is None:
-        plot_dir = os.path.join(os.path.dirname(os.path.abspath(__file__)), "..", "data", "plots")
+        plot_dir = default_results_dir()
     os.makedirs(plot_dir, exist_ok=True)
     tau_th, Cnn_th, _, g = theory_binary_autocorr(sigma, beta, mu, f0, f1)
     tau_s, Cnn_s, _ = sim_binary_network(
@@ -1070,7 +1070,7 @@ def plot_binary_network_N_convergence(sigma=0.8, N_vals=(128, 300, 800, 1600),
     """
     import os
     if plot_dir is None:
-        plot_dir = os.path.join(os.path.dirname(os.path.abspath(__file__)), "..", "data", "plots")
+        plot_dir = default_results_dir()
     os.makedirs(plot_dir, exist_ok=True)
     print(f"\n-- Binary network: N convergence at sigma={sigma} --")
     tau_th, Cnn_th, Cuu_th, g = theory_binary_autocorr(sigma, beta, mu, f0, f1)

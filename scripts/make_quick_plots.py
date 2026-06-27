@@ -21,7 +21,7 @@ def load_module():
 
 def main():
     mod = load_module()
-    out_dir = Path(__file__).resolve().parents[1] / "plots"
+    out_dir = Path(mod.default_results_dir("quick"))
     out_dir.mkdir(parents=True, exist_ok=True)
 
     # Use a larger default rate-network size to reduce finite-size bias.

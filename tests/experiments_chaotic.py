@@ -5,7 +5,8 @@ with varying network sizes N.
 """
 import numpy as np
 import matplotlib.pyplot as plt
-from python.simulations.random_network import sim_phase_network, theory_phase_autocorr
+from pathlib import Path
+from python.simulations.random_network import default_results_dir, sim_phase_network, theory_phase_autocorr
 
 # Parameters
 I, alpha, beta = 1.0, 1.0, 1.0
@@ -65,8 +66,10 @@ for i_N, N in enumerate(N_values):
             ax.legend(fontsize=8, loc='upper right')
 
 plt.tight_layout()
-plt.savefig('python/plots/chaotic_regimes_N_scan.png', dpi=120, bbox_inches='tight')
-print("\n✓ Saved chaotic_regimes_N_scan.png")
+outpath = Path(default_results_dir("diagnostics")) / "chaotic_regimes_N_scan.png"
+outpath.parent.mkdir(parents=True, exist_ok=True)
+plt.savefig(outpath, dpi=120, bbox_inches='tight')
+print(f"\n✓ Saved {outpath}")
 plt.close()
 
 # Create a second figure: Autocorr decay vs sigma for different N
@@ -114,8 +117,10 @@ ax.legend(fontsize=10)
 ax.grid(True, alpha=0.3)
 
 plt.tight_layout()
-plt.savefig('python/plots/chaos_summary_statistics.png', dpi=120, bbox_inches='tight')
-print("✓ Saved chaos_summary_statistics.png")
+outpath = Path(default_results_dir("diagnostics")) / "chaos_summary_statistics.png"
+outpath.parent.mkdir(parents=True, exist_ok=True)
+plt.savefig(outpath, dpi=120, bbox_inches='tight')
+print(f"✓ Saved {outpath}")
 plt.close()
 
 print("\nExperiments complete!")

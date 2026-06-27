@@ -2,7 +2,8 @@
 """Test with increased firing rates to see if amplitude mismatch is resolved."""
 import numpy as np
 import matplotlib.pyplot as plt
-from python.simulations.random_network import sim_phase_network, theory_phase_autocorr
+from pathlib import Path
+from python.simulations.random_network import default_results_dir, sim_phase_network, theory_phase_autocorr
 
 I_values = [1.0, 2.0, 5.0, 10.0]
 sigma = 0.8 * 2 * np.pi
@@ -56,5 +57,7 @@ for idx, I in enumerate(I_values):
     ax.set_xlim([0, 5])
 
 plt.tight_layout()
-plt.savefig('test_higher_firing_rates.png', dpi=150)
-print("✓ Saved test_higher_firing_rates.png")
+outpath = Path(default_results_dir("diagnostics")) / "test_higher_firing_rates.png"
+outpath.parent.mkdir(parents=True, exist_ok=True)
+plt.savefig(outpath, dpi=150)
+print(f"✓ Saved {outpath}")

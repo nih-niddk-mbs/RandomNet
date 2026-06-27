@@ -1,9 +1,0 @@
-fig02_phase_theory_examples.png
-fig03_phase_theory_comparison.png
-fig04_phase_beta_scaling.png
-fig05_phase_transition_ringing.png
-fig06a_phase_u_timeseries.png
-fig06b_phase_raster.png
-fig07_binary_exact.png
-fig08_binary_N_convergence.png
-fig09_binary_clipped.png

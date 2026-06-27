@@ -7,6 +7,9 @@ Simulations to test the 2PI effective action theory for random neural networks:
 Run each section independently. Requires numpy, scipy, matplotlib.
 """
 
+import os
+from pathlib import Path
+
 import numpy as np
 from numpy.fft import fft, ifft, fftfreq
 import matplotlib.pyplot as plt
@@ -28,6 +31,14 @@ def autocorr(x, max_lag):
     return full / nrm
 
 
+def default_results_dir(*parts):
+    """Return the default external results directory."""
+    root = os.environ.get("RANDOMNET_RESULTS_DIR")
+    if root is None:
+        root = Path.home() / "Library" / "CloudStorage" / "OneDrive-NationalInstitutesofHealth" / "randomnet"
+    return str(Path(root, *parts))
+
+
 def make_weights(N, sigma, lam=1, rng=rng):
     """
     Draw NxN Gaussian weights with std sigma/sqrt(N).
@@ -35,9 +46,13 @@ def make_weights(N, sigma, lam=1, rng=rng):
     lam=0  -> plain Gaussian
     """
     W = rng.normal(0, sigma / np.sqrt(N), (N, N))
-    if lam:
-        W -= W.mean(axis=1, keepdims=True)
     np.fill_diagonal(W, 0)
+    if lam:
+        if N <= 1:
+            return W
+        offdiag = ~np.eye(N, dtype=bool)
+        row_sums = W.sum(axis=1, keepdims=True)
+        W[offdiag] -= np.repeat(row_sums / (N - 1), N, axis=1)[offdiag]
     return W
 
 
@@ -228,7 +243,7 @@ def plot_rate_network(sigma=1.5, N=512, C0_guess=0.8, plot_dir=None):
     """Compare simulation vs theory for rate network."""
     import os
     if plot_dir is None:
-        plot_dir = os.path.join(os.path.dirname(os.path.abspath(__file__)), "..", "plots")
+        plot_dir = default_results_dir()
     os.makedirs(plot_dir, exist_ok=True)
     print(f"Simulating rate network: N={N}, sigma={sigma} ...")
     tau_sim, C_sim = sim_rate_network(N=N, sigma=sigma)
@@ -479,7 +494,7 @@ def plot_phase_spike_correlation(
     """Compare phase-model spike autocorrelation from simulation and theory."""
     import os
     if plot_dir is None:
-        plot_dir = os.path.join(os.path.dirname(os.path.abspath(__file__)), "..", "plots")
+        plot_dir = default_results_dir()
     os.makedirs(plot_dir, exist_ok=True)
     _, _, sigma_c = theory_phase_autocorr(
         I=I,
@@ -554,7 +569,7 @@ def plot_phase_network(
     """Compare phase-network simulation and reduced-theory autocorrelations."""
     import os
     if plot_dir is None:
-        plot_dir = os.path.join(os.path.dirname(os.path.abspath(__file__)), "..", "plots")
+        plot_dir = default_results_dir()
     os.makedirs(plot_dir, exist_ok=True)
     rho = 1.0 / (2.0 * np.pi)
     Fprime0 = float(np.maximum(I, 1e-10) ** (1.0 / alpha - 1.0))
@@ -1099,7 +1114,7 @@ def plot_clipped_vs_linear(
     """Compare clipped simulation with clipped-vs-linear theory predictions."""
     import os
     if plot_dir is None:
-        plot_dir = os.path.join(os.path.dirname(os.path.abspath(__file__)), "..", "plots")
+        plot_dir = default_results_dir()
     os.makedirs(plot_dir, exist_ok=True)
     cached = {}
     cache_updated = False
@@ -1222,7 +1237,7 @@ def plot_binary_network(
     """
     import os
     if plot_dir is None:
-        plot_dir = os.path.join(os.path.dirname(os.path.abspath(__file__)), "..", "plots")
+        plot_dir = default_results_dir()
     os.makedirs(plot_dir, exist_ok=True)
     fig, axes = plt.subplots(2, len(sigma_vals), figsize=(5 * len(sigma_vals), 8))
     if len(sigma_vals) == 1:
@@ -1326,7 +1341,7 @@ def plot_two_timescale_fit(
     """
     import os
     if plot_dir is None:
-        plot_dir = os.path.join(os.path.dirname(os.path.abspath(__file__)), "..", "plots")
+        plot_dir = default_results_dir()
     os.makedirs(plot_dir, exist_ok=True)
     tau_th, Cnn_th, _, g = theory_binary_autocorr(sigma, beta, mu, f0, f1)
     tau_s, Cnn_s, _ = sim_binary_network(
@@ -1406,7 +1421,7 @@ def plot_binary_network_N_convergence(sigma=0.8, N_vals=(128, 300, 800, 1600),
     """
     import os
     if plot_dir is None:
-        plot_dir = os.path.join(os.path.dirname(os.path.abspath(__file__)), "..", "plots")
+        plot_dir = default_results_dir()
     os.makedirs(plot_dir, exist_ok=True)
     print(f"\n-- Binary network: N convergence at sigma={sigma} --")
     tau_th, Cnn_th, Cuu_th, g = theory_binary_autocorr(sigma, beta, mu, f0, f1)
@@ -1468,9 +1483,8 @@ def plot_binary_network_N_convergence(sigma=0.8, N_vals=(128, 300, 800, 1600),
 
 if __name__ == "__main__":
     import os
-    # Save plots in python/plots directory
-    script_dir = os.path.dirname(os.path.abspath(__file__))
-    plot_dir = os.path.join(script_dir, "..", "plots")
+    # Save plots in the configured external results directory
+    plot_dir = default_results_dir()
     os.makedirs(plot_dir, exist_ok=True)
     print(f"Saving plots to: {plot_dir}")
 

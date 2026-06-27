@@ -7,13 +7,14 @@ matplotlib.use('Agg')
 import numpy as np
 
 from random_network import (
+    default_results_dir,
     plot_phase_corr_params,
     plot_phase_corr_N,
     plot_phase_network,
     theory_phase_autocorr,
 )
 
-plot_dir = os.path.join(os.getcwd(), 'data', 'plots')
+plot_dir = default_results_dir()
 os.makedirs(plot_dir, exist_ok=True)
 
 I, alpha, beta = 1.0, 1.0, 1.0

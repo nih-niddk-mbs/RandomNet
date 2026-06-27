@@ -2,7 +2,8 @@
 """Measure Lyapunov exponent across all σ values to confirm no chaos."""
 import numpy as np
 import matplotlib.pyplot as plt
-from python.simulations.random_network import make_weights
+from pathlib import Path
+from python.simulations.random_network import default_results_dir, make_weights
 
 I, alpha, beta = 1.0, 1.0, 1.0
 sigma_c = 2 * np.pi
@@ -90,5 +91,7 @@ ax2.set_title('Trajectory divergence decay')
 ax2.grid(True, alpha=0.3, which='both')
 
 plt.tight_layout()
-plt.savefig('lyapunov_spectrum.png', dpi=150)
-print("✓ Saved lyapunov_spectrum.png")
+outpath = Path(default_results_dir("diagnostics")) / "lyapunov_spectrum.png"
+outpath.parent.mkdir(parents=True, exist_ok=True)
+plt.savefig(outpath, dpi=150)
+print(f"✓ Saved {outpath}")
