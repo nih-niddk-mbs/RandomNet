@@ -1,106 +1,53 @@
 # RandomNet
 
-Simulation and theory experiments for randomly connected neural networks,
-including rate, phase/spiking, and binary-neuron models.
+Code used to reproduce the figures in the RandomNet paper. Simulation results,
+figure files, and the paper source live outside this repository in OneDrive.
 
-The current focus is comparing simulations with several 2PI/Gaussian-closure
-approximations.  Theory details and the meaning of the different criticality
-measures are summarized in [docs/theory_closures.md](docs/theory_closures.md).
+## Contents
 
-## Repository Layout
+- `scripts/rn_core.py`: row-sum-corrected random weights and correlation helpers.
+- `scripts/rn_rate.py`: rate-network simulation and SCS closure.
+- `scripts/rn_binary.py`: binary-network simulation and analytic closures.
+- `scripts/rn_phase.py`: phase-reset simulation and cusp-based scalar 2PI closure.
+- `scripts/make_paper_figures.py`: the single entry point for all paper figures.
+- `tests/`: regression tests for row-sum correction and the same-spike cusp.
+
+The phase closure follows the paper's decomposition of the spike covariance into
+same-spike and distinct-spike pieces. The same-spike term fixes
 
 ```text
-RandomNet/
-├── scripts/
-│   ├── random_network.py      # Compatibility facade and command-line examples
-│   ├── rn_core.py             # Shared RNG, weights, autocorrelation helpers
-│   ├── rn_rate.py             # Rate-network simulation/theory/plots
-│   ├── rn_phase.py            # Phase-network simulation/theory/plots
-│   ├── rn_binary.py           # Binary-neuron simulation/theory/plots
-│   ├── make_quick_plots.py    # Small binary/rate plotting script
-│   └── make_paper_figures.py  # Curated paper-figure driver
-├── docs/
-│   └── theory_closures.md     # Notes on closures and criticality
-├── tests/                     # Development diagnostics
-├── julia/                     # Reference/older Julia implementation
-├── environment.yml
-└── pyproject.toml
+C11'(0+) = -beta^2 sigma^2 mean_rate / 2,
 ```
 
-## Environment
+and `C11(0)` is solved from the associated cusp energy equation. The removed
+inflated-initial-condition and phenomenological-kernel closures are not part of
+the reproduction code.
 
-Recommended Conda environment:
+## Environment
 
 ```bash
 conda env create -f environment.yml
 conda activate randomnet-py
 ```
 
-On this workstation, the environment is commonly run via:
+On this workstation:
 
 ```bash
-/Users/carsonc/miniconda3/bin/conda run -n randomnet-py python ...
+/Users/carsonc/miniconda3/bin/conda run -n randomnet-py python \
+  scripts/make_paper_figures.py --profile quick
 ```
 
-## Common Commands
-
-Compile-check the main scripts:
-
-```bash
-python -m py_compile scripts/random_network.py run_phase_plots.py
-```
-
-Generate the phase comparison plots:
-
-```bash
-python run_phase_plots.py
-```
-
-Generate quick binary/rate plots:
-
-```bash
-python scripts/make_quick_plots.py
-```
-
-Generate the curated paper-figure set:
-
-```bash
-python scripts/make_paper_figures.py --profile quick
-python scripts/make_paper_figures.py --profile paper
-```
-
-The paper driver writes consistently named figures and a manifest under
-the external results folder's `paper/` subdirectory. Use
-`--figures phase-compare criticality` to regenerate only selected panels.
-
-Run the full plotting script:
-
-```bash
-python scripts/random_network.py
-```
-
-Generated plots and simulation caches are written outside the repository by
-default:
+Use `--profile paper` for publication runs. By default outputs are written to:
 
 ```text
-~/Library/CloudStorage/OneDrive-NationalInstitutesofHealth/randomnet/
+~/Library/CloudStorage/OneDrive-NationalInstitutesofHealth/randomnet/paper/
 ```
 
-Set `RANDOMNET_RESULTS_DIR=/path/to/results` to override this location. Only
-code and documentation should live in the repository.
+Set `RANDOMNET_RESULTS_DIR` to change the external output root. The paper driver
+also accepts `--plot-dir` for a one-off destination.
 
-## Main Theory Entrypoints
+Run the regression tests with:
 
-- `rn_rate.theory_rate_autocorr`: rate-network SCS theory.
-- `rn_phase.theory_phase_autocorr`: phase-network inflated-initial-condition
-  closure with Hermite covariance options.
-- `rn_phase.phase_operational_criticality`: branch-existence criticality for a selected
-  phase closure.
-- `rn_binary.theory_binary_autocorr`: exact linear binary-neuron theory.
-- `rn_binary.theory_binary_clipped_integral`: clipped binary-neuron integral closure.
-
-See [docs/theory_closures.md](docs/theory_closures.md) before interpreting
-plots, because several approximations are intentionally kept on the table.
-
-For backward compatibility, these names are also re-exported by
-`scripts/random_network.py`.
+```bash
+python -m pytest -q
+```

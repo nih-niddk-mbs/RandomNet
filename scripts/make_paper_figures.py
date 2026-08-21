@@ -4,7 +4,7 @@ The script writes to the configured RandomNet results folder by default. It inte
 active theory paths only:
 
   * rate SCS
-  * phase inflated-initial-condition closure, with optional exploratory kernel
+  * phase cusp closure with the exact same-spike contribution
   * binary exact linear theory
   * binary clipped-gain integral/effective closures
 
@@ -30,38 +30,41 @@ SCRIPTS = ROOT / "scripts"
 if str(SCRIPTS) not in sys.path:
     sys.path.insert(0, str(SCRIPTS))
 
-from random_network import (  # noqa: E402
-    default_results_dir,
-    plot_binary_network,
-    plot_binary_network_N_convergence,
-    plot_clipped_vs_linear,
+from rn_core import default_results_dir  # noqa: E402
+from rn_rate import plot_rate_network  # noqa: E402
+from rn_phase import (  # noqa: E402
     plot_phase_beta_scaling_diagnostic,
     plot_phase_operational_criticality,
     plot_phase_raster,
-    plot_phase_subcritical_ringing,
-    plot_phase_transition_ringing_sweep,
     plot_phase_theory_examples,
     plot_phase_theory_comparison,
-    plot_rate_network,
     plot_u_timeseries,
+)
+from rn_binary import (  # noqa: E402
+    plot_binary_network,
+    plot_binary_network_N_convergence,
+    plot_clipped_vs_linear,
 )
 
 
 PHASE_THEORY = dict(
-    solver="inflated_ic",
+    solver="cusp",
     q_method="hermite",
     n_quad=48,
     hermite_order=32,
 )
 
-PHASE_KERNEL_THEORY = dict(
-    solver="inflated_ic",
-    q_method="hermite",
-    n_quad=48,
-    hermite_order=32,
-    kernel_omega=2.0,
-    kernel_damping=1.0,
-    kernel_scaled_by_beta=True,
+PAPER_FIGURE_FILES = (
+    "fig01_rate_scs.png",
+    "fig02_phase_theory_examples.png",
+    "fig03_phase_theory_comparison.png",
+    "fig04_phase_beta_scaling.png",
+    "fig06a_phase_u_timeseries.png",
+    "fig06b_phase_raster.png",
+    "fig07_binary_exact.png",
+    "fig08_binary_N_convergence.png",
+    "fig09_binary_clipped.png",
+    "fig10_phase_criticality.png",
 )
 
 
@@ -76,23 +79,14 @@ def _copy_named(plot_dir: Path, source_name: str, target_name: str, manifest: li
     print(f"  -> {dst}")
 
 
-def _phase_variants(include_kernel: bool) -> list[dict]:
-    variants = [
+def _phase_variants() -> list[dict]:
+    return [
         dict(
-            label="inflated IC",
+            label="cusp closure",
             kwargs=dict(PHASE_THEORY),
-            style=dict(color="C2", ls="--", lw=2.0),
+            style=dict(color="C3", ls="--", lw=2.0),
         )
     ]
-    if include_kernel:
-        variants.append(
-            dict(
-                label="inflated IC + effective kernel",
-                kwargs=dict(PHASE_KERNEL_THEORY),
-                style=dict(color="C1", ls="-.", lw=1.9),
-            )
-        )
-    return variants
 
 
 def make_figures(profile: str, figures: set[str], plot_dir: Path, jobs: int) -> list[str]:
@@ -100,7 +94,7 @@ def make_figures(profile: str, figures: set[str], plot_dir: Path, jobs: int) -> 
     manifest: list[str] = []
     quick = profile == "quick"
 
-    rate_N = 384 if quick else 1024
+    rate_N = 384 if quick else 1536
     phase_N = 128 if quick else 256
     binary_N = 300 if quick else 800
     phase_T = 450.0 if quick else 900.0
@@ -120,7 +114,16 @@ def make_figures(profile: str, figures: set[str], plot_dir: Path, jobs: int) -> 
 
     if "rate" in figures:
         print("\n[fig01] rate SCS baseline")
-        plot_rate_network(sigma=1.8, N=rate_N, C0_guess=0.8, plot_dir=str(plot_dir))
+        plot_rate_network(
+            sigma=2.2,
+            N=rate_N,
+            C0_guess=0.8,
+            T=350.0 if quick else 1800.0,
+            burn=100.0 if quick else 400.0,
+            n_probe=192 if quick else 768,
+            sim_reps=2 if quick else 5,
+            plot_dir=str(plot_dir),
+        )
         _copy_named(plot_dir, "rate_network_test.png", "fig01_rate_scs.png", manifest)
 
     if "phase-theory" in figures:
@@ -135,7 +138,7 @@ def make_figures(profile: str, figures: set[str], plot_dir: Path, jobs: int) -> 
             burn=250.0,
             sim_reps=phase_reps,
             plot_dir=str(plot_dir),
-            theory_variants=_phase_variants(include_kernel=True),
+            theory_variants=_phase_variants(),
         )
         _copy_named(plot_dir, "phase_theory_examples.png", "fig02_phase_theory_examples.png", manifest)
 
@@ -150,7 +153,7 @@ def make_figures(profile: str, figures: set[str], plot_dir: Path, jobs: int) -> 
             burn=250.0,
             sim_reps=phase_reps,
             plot_dir=str(plot_dir),
-            theory_variants=_phase_variants(include_kernel=True),
+            theory_variants=_phase_variants(),
         )
         _copy_named(plot_dir, "phase_theory_comparison.png", "fig03_phase_theory_comparison.png", manifest)
 
@@ -165,33 +168,20 @@ def make_figures(profile: str, figures: set[str], plot_dir: Path, jobs: int) -> 
             burn=250.0,
             sim_reps=phase_reps,
             plot_dir=str(plot_dir),
-            theory_kwargs=dict(PHASE_KERNEL_THEORY),
+            theory_kwargs=dict(PHASE_THEORY),
         )
         _copy_named(plot_dir, "phase_beta_scaling_diagnostic.png", "fig04_phase_beta_scaling.png", manifest)
 
     if "criticality" in figures:
         print("\n[fig10] phase criticality diagnostics")
         plot_phase_operational_criticality(
-            alpha_vals=(0.5, 0.75, 1.0, 1.5, 2.0),
+            alpha_vals=(1.0, 1.25, 1.5, 2.0, 3.0),
             g_bounds=(0.25, 1.8),
             n_scan=10 if quick else 28,
             theory_kwargs=dict(tau_max=1.0, dtau=0.1, **PHASE_THEORY),
             plot_dir=str(plot_dir),
         )
         _copy_named(plot_dir, "phase_operational_criticality.png", "fig10_phase_criticality.png", manifest)
-
-    if "phase-ringing" in figures:
-        print("\n[fig05] phase transition ringing sweep")
-        plot_phase_transition_ringing_sweep(
-            N=128 if quick else 256,
-            T=650.0 if quick else 1400.0,
-            dt=0.02,
-            tau_max=25.0 if quick else 40.0,
-            burn=250.0,
-            n_probe=64 if quick else 128,
-            plot_dir=str(plot_dir),
-        )
-        _copy_named(plot_dir, "phase_transition_ringing_sweep.png", "fig05_phase_transition_ringing.png", manifest)
 
     if "phase-activity" in figures:
         print("\n[fig06] phase activity examples")
@@ -250,8 +240,9 @@ def make_figures(profile: str, figures: set[str], plot_dir: Path, jobs: int) -> 
         )
         _copy_named(plot_dir, "clipped_vs_linear.png", "fig09_binary_clipped.png", manifest)
 
+    inventory = [name for name in PAPER_FIGURE_FILES if (plot_dir / name).exists()]
     readme = plot_dir / "MANIFEST.txt"
-    readme.write_text("\n".join(manifest) + "\n", encoding="utf-8")
+    readme.write_text("\n".join(inventory) + "\n", encoding="utf-8")
     print(f"\nWrote manifest: {readme}")
     return manifest
 
@@ -262,7 +253,6 @@ def parse_args() -> argparse.Namespace:
         "phase-theory",
         "phase-compare",
         "phase-beta",
-        "phase-ringing",
         "criticality",
         "phase-activity",
         "binary",
@@ -302,7 +292,6 @@ def main() -> None:
             "phase-theory",
             "phase-compare",
             "phase-beta",
-            "phase-ringing",
             "criticality",
             "phase-activity",
             "binary",

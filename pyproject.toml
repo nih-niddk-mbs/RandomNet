@@ -19,14 +19,8 @@ dependencies = [
 
 [project.optional-dependencies]
 dev = [
-    "jupyter",
-    "ipython",
     "pytest",
 ]
-
-[tool.setuptools.packages.find]
-where = ["."]
-include = ["randomnet*"]
 
 [project.urls]
 Repository = "https://github.com/carsonc/RandomNet"

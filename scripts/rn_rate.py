@@ -24,6 +24,7 @@ def sim_rate_network(
     lam=1,
     burn=200,
     n_probe=64,
+    tau_max=50.0,
     rng=rng,
 ):
     """
@@ -49,16 +50,16 @@ def sim_rate_network(
     for _ in range(nb):
         u += dt * (-u + W @ f(u))
 
-    # record
-    U = np.zeros((nt, N))
+    n_probe = int(max(1, min(N, n_probe)))
+    probe_idx = np.arange(n_probe)
+    U = np.zeros((nt, n_probe))
     for t in range(nt):
         u += dt * (-u + W @ f(u))
-        U[t] = u
+        U[t] = u[probe_idx]
 
     # Average autocorrelation over a subset of neurons.
     # Using more probes reduces large-lag variance in finite simulations.
-    max_lag = int(50 / dt)
-    n_probe = int(max(1, min(N, n_probe)))
+    max_lag = int(tau_max / dt)
     C = np.mean([autocorr(U[:, i], max_lag) for i in range(n_probe)], axis=0)
     tau = np.arange(len(C)) * dt
     return tau, C
@@ -194,28 +195,64 @@ def theory_rate_autocorr(
     return tau, C
 
 
-def plot_rate_network(sigma=1.5, N=512, C0_guess=0.8, plot_dir=None):
+def plot_rate_network(
+    sigma=2.2,
+    N=1536,
+    C0_guess=0.8,
+    T=1800.0,
+    dt=0.05,
+    burn=400.0,
+    n_probe=768,
+    sim_reps=5,
+    seeds=(301, 302, 303, 304, 305),
+    tau_max=50.0,
+    n_quad=48,
+    plot_dir=None,
+):
     """Compare simulation vs theory for rate network."""
     import os
     if plot_dir is None:
         plot_dir = default_results_dir()
     os.makedirs(plot_dir, exist_ok=True)
     print(f"Simulating rate network: N={N}, sigma={sigma} ...")
-    tau_sim, C_sim = sim_rate_network(N=N, sigma=sigma)
-    C_sim /= C_sim[0]  # normalise
+    runs = []
+    tau_sim = None
+    for rep in range(int(sim_reps)):
+        seed = int(seeds[rep]) if rep < len(seeds) else int(seeds[-1]) + rep
+        tau_sim, covariance = sim_rate_network(
+            N=N,
+            sigma=sigma,
+            T=T,
+            dt=dt,
+            burn=burn,
+            n_probe=n_probe,
+            tau_max=tau_max,
+            rng=np.random.default_rng(seed),
+        )
+        runs.append(covariance / covariance[0])
+    C_sim = np.mean(runs, axis=0)
 
     print("Computing theory ...")
-    tau_th, C_th = theory_rate_autocorr(C0=C0_guess, sigma=sigma)
+    tau_th, C_th = theory_rate_autocorr(
+        C0=C0_guess,
+        sigma=sigma,
+        tau_max=tau_max,
+        n_quad=n_quad,
+    )
+    C_th_norm = C_th / C_th[0]
+    comparison = np.interp(tau_sim, tau_th, C_th_norm)
+    mask = tau_sim <= min(20.0, tau_max)
+    rmse = float(np.sqrt(np.mean((C_sim[mask] - comparison[mask]) ** 2)))
 
     fig, axes = plt.subplots(1, 2, figsize=(12, 4))
 
     ax = axes[0]
     ax.plot(tau_sim, C_sim, "b", lw=1.5, label="Simulation")
-    ax.plot(tau_th, C_th / C_th[0], "r--", lw=2, label="SCS theory")
+    ax.plot(tau_th, C_th_norm, "r--", lw=2, label="SCS theory")
     ax.set(
         xlabel=r"$\tau$",
         ylabel=r"$C_{11}(\tau)/C_{11}(0)$",
-        title=f"Rate network  $\sigma={sigma}$",
+        title=fr"Rate network $\sigma={sigma:g}$ (RMSE={rmse:.4f})",
         xlim=(0, 20),
     )
     ax.legend()
@@ -234,10 +271,13 @@ def plot_rate_network(sigma=1.5, N=512, C0_guess=0.8, plot_dir=None):
     )
     ax.legend()
 
-    plt.suptitle("Rate network: SCS test", fontsize=13, fontweight="bold")
+    plt.suptitle(
+        f"Rate-network SCS calibration ({sim_reps} finite-network runs)",
+        fontsize=13,
+        fontweight="bold",
+    )
     plt.tight_layout()
     plt.savefig(os.path.join(plot_dir, "rate_network_test.png"), dpi=150)
     print(f"Saved to {os.path.join(plot_dir, 'rate_network_test.png')}")
     plt.close("all")
-
 
