@@ -10,11 +10,16 @@ rng = np.random.default_rng(42)
 
 
 def default_results_dir(*parts):
-    """Return the default external results directory."""
+    """Return a writable results directory outside the repository.
+
+    ``RANDOMNET_RESULTS_DIR`` has priority.  The portable fallback is
+    ``~/randomnet-results``.
+    """
     root = os.environ.get("RANDOMNET_RESULTS_DIR")
     if root is None:
-        root = Path.home() / "Library" / "CloudStorage" / "OneDrive-NationalInstitutesofHealth" / "randomnet"
-    return str(Path(root, *parts))
+        root = Path.home() / "randomnet-results"
+    return str(Path(root).expanduser().joinpath(*parts))
+
 
 def autocorr(x, max_lag):
     """Unbiased autocorrelation via FFT, normalised so C(0)=variance."""
