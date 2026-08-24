@@ -10,12 +10,21 @@ directory rather than in this repository.
 - `scripts/rn_rate.py`: rate-network simulation and SCS closure.
 - `scripts/rn_binary.py`: sigmoid binary-network simulation, dynamic DMFT,
   and the controlled affine-tangent benchmark.
-- `scripts/rn_phase.py`: phase-reset simulation, stationary and full two-time
-  event-DMFT closures of the 2PI drive equation, and scalar comparisons.
+- `scripts/rn_phase.py`: threshold-reset simulation, stationary and full
+  two-time event-DMFT closures, general phase laws, transformed theta/QIF,
+  LIF event sampling, and tangent chaos diagnostics.
+- `scripts/rn_lif_fp.py`: density-level LIF--OU Fokker--Planck generator,
+  threshold-flux propagator quadrature, and a one-mode closure diagnostic.
 - `scripts/rn_phase_2pi.py`: the homogeneous Hartree/Wick phase approximation,
   its feedback-stability calculation, and the rejected fixed-kernel
   diagnostic retained for regression testing.
 - `scripts/make_paper_figures.py`: the single entry point for all paper figures.
+- `scripts/rn_chaos.py`: Lyapunov and replica scans plus transformed-theta and
+  LIF activity and covariance comparisons.
+- `scripts/make_chaos_figures.py`: independent driver for the separate
+  `randnetchaos` manuscript.
+- `scripts/benchmark_lif_fp.py`: prescribed-drive quadrature validation and
+  Markov-mode closure benchmark.
 - `tests/`: regression tests for row-sum correction, the same-spike cusp, and
   threshold-return peaks.
 
@@ -37,12 +46,62 @@ diagnostics report the spectral residual and
 
 The stationary phase event-DMFT solver uses common-random-number Fourier
 synthesis, deterministic phase advection, complete threshold event counts,
-and the exact discrete synaptic transfer function. The two-time solver instead
+and exact within-step filtering of every event time. The two-time solver instead
 factorizes and iterates the full covariance matrix and reports a Frobenius
 residual. The Hartree/Wick calculation discretizes the causal propagator
 equations and uses a matrix-free Arnoldi calculation for its feedback
 stability. Convergence should be checked separately in time step, path length,
 path count, phase-grid size, and fixed-point tolerance.
+
+The chaos calculations use a general one-dimensional law
+`phi_dot = g(phi, u)`. Built-in models include the legacy power law, the
+transformed theta neuron, and a leaky integrate-and-fire threshold/reset law;
+a circular custom law can be passed as a callable. For `I > 0`, the theta
+transformation is
+
+```text
+tan(theta/2) = sqrt(I) tan(phi/2)
+phi_dot = 2 sqrt(I) + (1 + cos(phi)) u / sqrt(I).
+```
+
+The maximal Lyapunov calculation differentiates the theta and exact LIF maps
+and every within-step event time analytically. The tangent two-replica calculation
+power-iterates the Frechet derivative of the event-DMFT covariance map.
+Neither calculation diagnoses chaos from covariance decay alone.
+
+For a prescribed Ornstein--Uhlenbeck drive, the density-level effective-action
+saddle is evaluated without drive-path sampling by `rn_lif_fp`. A conservative
+finite-volume generator evolves the joint LIF voltage and drive density. Its
+threshold probability flux is reinserted at reset, and propagating the
+stationary event-flux measure gives the two-event covariance. Synaptic
+filtering is the deterministic quadrature
+
+```text
+C_y(tau) = beta mean_rate exp(-beta |tau|) / 2
+           + integral beta exp(-beta |tau-s|) Q_regular(s) ds / 2.
+```
+
+This is exact for a prescribed OU covariance up to state-grid and lag
+quadrature error. Projecting the self-consistent ringing covariance onto one
+OU exponential is retained only as a diagnostic: the projection converges in
+its two parameters but discards most of the covariance norm. A general
+path-free closure therefore requires a structure-preserving multi-mode
+Gaussian generator, such as a Hermite/spectral discretization; the one-mode
+diagnostic is not used as paper theory.
+
+The same generator also supplies a first-return approximation through
+`solve_lif_ou_first_return_renewal`. Reset reinjection is removed, the
+stationary spike-conditioned drive distribution is propagated to its next
+threshold crossing, and the resulting FPT density is inserted into the
+renewal equation. This preserves the complete marginal interval law while
+discarding serial dependence between successive intervals. Comparing it with
+the reinjecting propagator therefore measures the renewal approximation itself,
+not a mismatch between two single-neuron discretizations.
+
+`compute_lif_ou_return_map` integrates the same absorbing propagator over all
+return times. The resulting drive-state matrix is `P = -D L_abs^{-1} B`; its
+subleading eigenvalue measures memory retained per spike, and
+`-mean_interval/log(abs(lambda_2))` estimates the physical correlation time.
 
 For prescribed threshold-flux kernel `Q`, the causal Gaussian 2PI equations
 give `C11 = beta**2 * sigma**2 * R Q R.T`. The implemented phase calculation
@@ -108,7 +167,11 @@ import numpy as np
 
 from rn_rate import sim_rate_network, theory_rate_autocorr
 from rn_binary import sim_binary_network, theory_binary_sigmoid_dmft
-from rn_phase import sim_phase_network, theory_phase_autocorr
+from rn_phase import (
+    maximal_lyapunov_phase_network,
+    sim_phase_network,
+    theory_phase_autocorr,
+)
 
 # Rate model: simulation and SCS theory.
 tau_sim, C_sim = sim_rate_network(
@@ -153,6 +216,23 @@ tau_stationary, Cuu_stationary, _ = theory_phase_autocorr(
     solver="density",
     tau_max=15.0,
 )
+
+# Transformed theta/QIF model and a direct chaos diagnostic.
+tau_theta, Cuu_theta = sim_phase_network(
+    N=128,
+    I=1.0,
+    sigma=1.0,
+    T=200.0,
+    burn=50.0,
+    phase_model="theta",
+    rng=np.random.default_rng(4),
+)
+lambda_max = maximal_lyapunov_phase_network(
+    N=128,
+    I=1.0,
+    sigma=1.0,
+    phase_model="theta",
+)
 ```
 
 The plotting functions are independent as well. Give them an external output
@@ -194,8 +274,13 @@ The principal entry points are:
   binary plotting functions. `theory_binary_autocorr` is the formal affine
   benchmark used by the tangent calculation.
 - `rn_phase`: `sim_phase_network`, `theory_phase_autocorr`,
-  `theory_phase_density_autocorr`, `theory_phase_twotime_dmft`, and the phase
-  plotting and finite-size functions.
+  `theory_phase_density_autocorr`, `theory_phase_twotime_dmft`,
+  `maximal_lyapunov_phase_network`, `phase_replica_stability_dmft`, and the
+  phase plotting and finite-size functions.
+- `rn_chaos`: Lyapunov/replica scans and generic theta/LIF figure functions.
+- `rn_lif_fp`: `solve_lif_ou_fokker_planck`,
+  `solve_lif_ou_first_return_renewal`, `compute_lif_ou_return_map`,
+  `validate_lif_ou_fokker_planck`, and `solve_projected_lif_ou_dmft`.
 - `rn_phase_2pi`: Gaussian/Hartree, fixed-kernel, propagator, and stability
   solvers used by the phase comparisons.
 
@@ -216,6 +301,25 @@ Run the publication calculations with:
 
 ```bash
 python scripts/make_paper_figures.py --profile paper
+```
+
+The separate chaos manuscript has its own output names and never overwrites
+the main paper figures:
+
+```bash
+python scripts/make_chaos_figures.py \
+  --profile quick \
+  --output-dir /path/to/randnetchaos \
+  --jobs 2
+
+python scripts/make_chaos_figures.py \
+  --profile paper \
+  --output-dir /path/to/randnetchaos \
+  --jobs 10
+
+python scripts/benchmark_lif_fp.py \
+  --profile paper \
+  --output-dir /path/to/randnetchaos
 ```
 
 By default, publication output is written directly to:

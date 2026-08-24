@@ -12,10 +12,160 @@ from rn_phase_2pi import (
 )
 
 # -----------------------------------------------------------------------------
-# 1b. PHASE NEURON NETWORK
-#     phi_i in [-pi, pi], dphi_i/dt = alpha * max(I + u_i, 0)^(1/alpha)
-#     spikes when phi_i crosses pi; u_i is driven by spike input through W.
+# TRANSFORMED THETA NEURON
+#
+# Starting from
+#   theta_dot = 1 - cos(theta) + (I + u) (1 + cos(theta)),
+# the change tan(theta/2) = sqrt(I) tan(phi/2), for I > 0, gives
+#   phi_dot = 2 sqrt(I) + (1 + cos(phi)) u / sqrt(I).
+# The threshold theta=pi is phi=pi.  Its velocity is always 2 sqrt(I), so
+# spikes remain well defined even when the recurrent field is strongly negative.
 # -----------------------------------------------------------------------------
+
+
+def phase_velocity(phi, u, I=1.0, alpha=1.0, model="theta"):
+    """Evaluate the general microscopic law ``phi_dot = g(phi, u)``.
+
+    ``theta`` is the publication model and is exactly equivalent to the theta
+    neuron for positive tonic drive. ``power`` retains the earlier clipped
+    model solely for reproducing legacy closure diagnostics. A callable model
+    must accept ``(phi, u)`` and may therefore represent any smooth phase law.
+    """
+    if callable(model):
+        return np.asarray(model(phi, u), dtype=float)
+    model = str(model).lower()
+    if model in ("theta", "transformed_theta", "transformed-theta"):
+        if I <= 0.0:
+            raise ValueError("the transformed theta model requires I > 0")
+        root_I = np.sqrt(float(I))
+        return 2.0 * root_I + (1.0 + np.cos(phi)) * u / root_I
+    if model in ("power", "legacy", "clipped"):
+        return alpha * np.clip(I + u, 0.0, 1e12) ** (1.0 / alpha)
+    if model in ("lif", "leaky_integrate_and_fire", "leaky-integrate-and-fire"):
+        return I - phi + u
+    raise ValueError("phase model must be 'theta', 'lif', 'power', or callable")
+
+
+def phase_input_gain(phi, I=1.0, alpha=1.0, u=None, model="theta"):
+    """Return the derivative of phase velocity with respect to recurrent input."""
+    if callable(model):
+        if u is None:
+            raise ValueError("u is required to differentiate a custom phase law")
+        u = np.asarray(u, dtype=float)
+        step = np.sqrt(np.finfo(float).eps) * np.maximum(1.0, np.abs(u))
+        return (
+            np.asarray(model(phi, u + step), dtype=float)
+            - np.asarray(model(phi, u - step), dtype=float)
+        ) / (2.0 * step)
+    model = str(model).lower()
+    if model in ("theta", "transformed_theta", "transformed-theta"):
+        if I <= 0.0:
+            raise ValueError("the transformed theta model requires I > 0")
+        return (1.0 + np.cos(phi)) / np.sqrt(float(I))
+    if model in ("power", "legacy", "clipped"):
+        if u is None:
+            raise ValueError("u is required for the legacy power model")
+        total = I + np.asarray(u)
+        derivative = np.zeros_like(total, dtype=float)
+        positive = total > 0.0
+        derivative[positive] = total[positive] ** (1.0 / alpha - 1.0)
+        return derivative
+    if model in ("lif", "leaky_integrate_and_fire", "leaky-integrate-and-fire"):
+        return np.ones_like(np.asarray(phi), dtype=float)
+    raise ValueError("phase model must be 'theta', 'lif', 'power', or callable")
+
+
+def _state_geometry(model):
+    """Return reset, threshold, and circularity for a built-in model."""
+    if callable(model):
+        return -np.pi, np.pi, True
+    key = str(model).lower()
+    if key in ("lif", "leaky_integrate_and_fire", "leaky-integrate-and-fire"):
+        return 0.0, 1.0, False
+    return -np.pi, np.pi, True
+
+
+def _uses_legacy_power_model(model):
+    return isinstance(model, str) and model.lower() in (
+        "power",
+        "legacy",
+        "clipped",
+    )
+
+
+def _advance_phase(phi, u, I, alpha, dt, model="theta"):
+    """Advance phases by a midpoint step and locate forward threshold events."""
+    old_phase = np.asarray(phi, dtype=float)
+    reset, threshold, circular = _state_geometry(model)
+    if not circular:
+        # Exact constant-input step for dv/dt = I + u - v. This handles more
+        # than one threshold crossing without introducing a reset-time bias.
+        asymptote = I + np.asarray(u, dtype=float)
+        phase_new = asymptote + (old_phase - asymptote) * np.exp(-dt)
+        counts = np.zeros(old_phase.shape, dtype=int)
+        displacement = phase_new - old_phase
+        active = (asymptote > threshold) & (old_phase < threshold)
+        indices = np.flatnonzero(active)
+        for sample in indices:
+            first = -np.log(
+                (threshold - asymptote[sample])
+                / (old_phase[sample] - asymptote[sample])
+            )
+            if first > dt:
+                continue
+            period = -np.log(
+                (threshold - asymptote[sample])
+                / (reset - asymptote[sample])
+            )
+            count = 1 + int(np.floor(max(dt - first, 0.0) / period))
+            last = first + (count - 1) * period
+            counts[sample] = count
+            phase_new[sample] = asymptote[sample] + (
+                reset - asymptote[sample]
+            ) * np.exp(-(dt - last))
+            # Encode the first crossing fraction for the event-weight helper.
+            displacement[sample] = (threshold - old_phase[sample]) * dt / first
+        return phase_new, counts, displacement
+
+    velocity_0 = phase_velocity(old_phase, u, I=I, alpha=alpha, model=model)
+    midpoint = old_phase + 0.5 * dt * velocity_0
+    velocity_mid = phase_velocity(midpoint, u, I=I, alpha=alpha, model=model)
+    unwrapped = old_phase + dt * velocity_mid
+    raw_counts = np.floor((unwrapped + np.pi) / (2.0 * np.pi)).astype(int)
+    counts = np.maximum(raw_counts, 0)
+    phase_new = ((unwrapped + np.pi) % (2.0 * np.pi)) - np.pi
+    displacement = unwrapped - old_phase
+    return phase_new, counts, displacement
+
+
+def _filtered_event_counts(
+    old_phase, displacement, counts, beta, dt, model="theta", I=None, u=None
+):
+    """Apply within-step synaptic decay using interpolated threshold times."""
+    weighted = np.zeros_like(np.asarray(counts), dtype=float)
+    reset, threshold, circular = _state_geometry(model)
+    for sample in np.flatnonzero(np.asarray(counts) > 0):
+        if displacement[sample] <= 0.0:
+            continue
+        if circular:
+            thresholds = threshold + (threshold - reset) * np.arange(
+                int(counts[sample])
+            )
+            crossing_times = (
+                dt * (thresholds - old_phase[sample]) / displacement[sample]
+            )
+        else:
+            asymptote = float(I + u[sample])
+            first = -np.log(
+                (threshold - asymptote) / (old_phase[sample] - asymptote)
+            )
+            period = -np.log(
+                (threshold - asymptote) / (reset - asymptote)
+            )
+            crossing_times = first + period * np.arange(int(counts[sample]))
+        crossing_times = np.clip(crossing_times, 0.0, dt)
+        weighted[sample] = np.sum(np.exp(-beta * (dt - crossing_times)))
+    return weighted
 
 def sim_phase_network(
     N=512,
@@ -34,39 +184,22 @@ def sim_phase_network(
     return_phase_density=False,
     phase_bin_width=0.25,
     synapse_update="exact",
+    phase_model="power",
     rng=rng,
 ):
-    """Simulate a phase-reset network and return C_uu(tau).
+    """Simulate a threshold-reset network and return C_uu(tau).
 
     If return_spike is True, also return C_spk(tau) estimated from the
     whole-network population spike-rate time series r(t)=N_spk(t)/(N*dt).
     This is much smoother than averaging per-neuron sparse spike trains.
     """
     W = make_weights(N, sigma, lam, rng)
-    phi = rng.uniform(-np.pi, np.pi, N)
+    reset, threshold, circular = _state_geometry(phase_model)
+    phi = rng.uniform(reset, threshold, N)
     u = np.zeros(N)
     synapse_update = str(synapse_update).lower()
     if synapse_update not in ("exact", "euler"):
         raise ValueError("synapse_update must be 'exact' or 'euler'")
-
-    def F(u_):
-        return alpha * np.clip(I + u_, 0.0, 1e12) ** (1.0 / alpha)
-
-    def spike_weights(phi_old, rate, spike_counts):
-        """Return per-neuron spike counts, optionally filtered by event time."""
-        if synapse_update == "euler":
-            return spike_counts
-        weighted = np.zeros_like(spike_counts, dtype=float)
-        spiking = np.flatnonzero(spike_counts > 0)
-        for j in spiking:
-            count = int(spike_counts[j])
-            if count <= 0 or rate[j] <= 0.0:
-                continue
-            thresholds = np.pi + 2.0 * np.pi * np.arange(count)
-            crossing_times = (thresholds - phi_old[j]) / rate[j]
-            crossing_times = np.clip(crossing_times, 0.0, dt)
-            weighted[j] = np.sum(np.exp(-beta * (dt - crossing_times)))
-        return weighted
 
     def update_u(u_, drive_):
         # Spikes are delta events: integrating beta*W*dN gives beta*W*count,
@@ -79,14 +212,22 @@ def sim_phase_network(
     nb = int(burn / dt)
     for _ in range(nb):
         phi_old = phi.copy()
-        rate = F(u)
-        phi = phi_old + rate * dt
-        spike_counts = np.floor((phi + np.pi) / (2.0 * np.pi)).astype(float)
-        spikes = spike_counts > 0
-        # Correct multi-spike: wrap phi into (-pi, pi) regardless of how many
-        # cycles were completed in this step (F(u)*dt can exceed 2*pi for large u).
-        phi[spikes] = ((phi[spikes] + np.pi) % (2.0 * np.pi)) - np.pi
-        filtered_counts = spike_weights(phi_old, rate, spike_counts)
+        phi, spike_counts, displacement = _advance_phase(
+            phi_old, u, I, alpha, dt, model=phase_model
+        )
+        if synapse_update == "exact":
+            filtered_counts = _filtered_event_counts(
+                phi_old,
+                displacement,
+                spike_counts,
+                beta,
+                dt,
+                model=phase_model,
+                I=I,
+                u=u,
+            )
+        else:
+            filtered_counts = spike_counts
         with np.errstate(over="ignore", divide="ignore", invalid="ignore"):
             drive = W @ filtered_counts
         u = update_u(u, drive)
@@ -106,16 +247,26 @@ def sim_phase_network(
         else None
     )
     phase_bin_width = float(phase_bin_width)
-    if return_phase_density and not 0.0 < phase_bin_width <= 2.0 * np.pi:
-        raise ValueError("phase_bin_width must lie in (0, 2*pi]")
+    if return_phase_density and not 0.0 < phase_bin_width <= threshold - reset:
+        raise ValueError("phase_bin_width must not exceed the state span")
     for t in range(nt):
         phi_old = phi.copy()
-        rate = F(u)
-        phi = phi_old + rate * dt
-        spike_counts = np.floor((phi + np.pi) / (2.0 * np.pi)).astype(float)
-        spikes = spike_counts > 0
-        phi[spikes] = ((phi[spikes] + np.pi) % (2.0 * np.pi)) - np.pi
-        filtered_counts = spike_weights(phi_old, rate, spike_counts)
+        phi, spike_counts, displacement = _advance_phase(
+            phi_old, u, I, alpha, dt, model=phase_model
+        )
+        if synapse_update == "exact":
+            filtered_counts = _filtered_event_counts(
+                phi_old,
+                displacement,
+                spike_counts,
+                beta,
+                dt,
+                model=phase_model,
+                I=I,
+                u=u,
+            )
+        else:
+            filtered_counts = spike_counts
         with np.errstate(over="ignore", divide="ignore", invalid="ignore"):
             drive = W @ filtered_counts
         u = update_u(u, drive)
@@ -126,7 +277,7 @@ def sim_phase_network(
             R_pop[t] = np.mean(spike_counts) / dt
         if return_phase_density:
             Eta_probe[t] = (
-                phi[probe_idx] >= np.pi - phase_bin_width
+                phi[probe_idx] >= threshold - phase_bin_width
             ) / phase_bin_width
 
     max_lag = int(tau_max / dt)
@@ -150,6 +301,370 @@ def sim_phase_network(
         )
         out.append(C_density)
     return tuple(out)
+
+
+def _phase_network_step(
+    state,
+    recurrent_field,
+    weights,
+    I,
+    alpha,
+    beta,
+    dt,
+    phase_model="theta",
+):
+    """Advance one deterministic network step with exact synaptic decay."""
+    old_state = np.asarray(state, dtype=float)
+    new_state, counts, displacement = _advance_phase(
+        old_state,
+        recurrent_field,
+        I,
+        alpha,
+        dt,
+        model=phase_model,
+    )
+    weighted_counts = _filtered_event_counts(
+        old_state,
+        displacement,
+        counts,
+        beta,
+        dt,
+        model=phase_model,
+        I=I,
+        u=recurrent_field,
+    )
+    new_field = (
+        np.exp(-beta * dt) * recurrent_field
+        + beta * (weights @ weighted_counts)
+    )
+    return new_state, new_field, counts
+
+
+def _theta_network_tangent_step(
+    state,
+    recurrent_field,
+    tangent_state,
+    tangent_field,
+    weights,
+    I,
+    beta,
+    dt,
+):
+    """Advance the transformed-theta event map and its exact Jacobian."""
+    root_I = np.sqrt(float(I))
+    old_state = np.asarray(state, dtype=float)
+    velocity_0 = phase_velocity(old_state, recurrent_field, I=I, model="theta")
+    gphi_0 = -np.sin(old_state) * recurrent_field / root_I
+    gu_0 = (1.0 + np.cos(old_state)) / root_I
+    midpoint = old_state + 0.5 * dt * velocity_0
+    tangent_midpoint = tangent_state + 0.5 * dt * (
+        gphi_0 * tangent_state + gu_0 * tangent_field
+    )
+    velocity_mid = phase_velocity(midpoint, recurrent_field, I=I, model="theta")
+    gphi_mid = -np.sin(midpoint) * recurrent_field / root_I
+    gu_mid = (1.0 + np.cos(midpoint)) / root_I
+    unwrapped = old_state + dt * velocity_mid
+    tangent_unwrapped = tangent_state + dt * (
+        gphi_mid * tangent_midpoint + gu_mid * tangent_field
+    )
+    counts = np.maximum(
+        np.floor((unwrapped + np.pi) / (2.0 * np.pi)).astype(int), 0
+    )
+    new_state = ((unwrapped + np.pi) % (2.0 * np.pi)) - np.pi
+
+    displacement = unwrapped - old_state
+    tangent_displacement = tangent_unwrapped - tangent_state
+    weighted_counts = np.zeros_like(old_state)
+    tangent_counts = np.zeros_like(old_state)
+    for sample in np.flatnonzero(counts > 0):
+        if displacement[sample] <= 0.0:
+            continue
+        thresholds = np.pi + 2.0 * np.pi * np.arange(counts[sample])
+        numerator = thresholds - old_state[sample]
+        crossing_times = dt * numerator / displacement[sample]
+        tangent_times = dt * (
+            -tangent_state[sample] * displacement[sample]
+            - numerator * tangent_displacement[sample]
+        ) / displacement[sample] ** 2
+        event_weights = np.exp(-beta * (dt - crossing_times))
+        weighted_counts[sample] = np.sum(event_weights)
+        tangent_counts[sample] = np.sum(
+            beta * event_weights * tangent_times
+        )
+
+    decay = np.exp(-beta * dt)
+    new_field = decay * recurrent_field + beta * (weights @ weighted_counts)
+    new_tangent_field = decay * tangent_field + beta * (weights @ tangent_counts)
+    return new_state, new_field, tangent_unwrapped, new_tangent_field, counts
+
+
+def _lif_event_tangent_step(
+    state,
+    field,
+    tangent_state,
+    tangent_field,
+    I,
+    beta,
+    dt,
+):
+    """Advance exact LIF paths and differentiate every threshold/reset event."""
+    reset, threshold, _circular = _state_geometry("lif")
+    old_state = np.asarray(state, dtype=float)
+    field = np.asarray(field, dtype=float)
+    tangent_state = np.asarray(tangent_state, dtype=float)
+    tangent_field = np.asarray(tangent_field, dtype=float)
+    asymptote = I + field
+    decay_state = np.exp(-dt)
+    new_state = asymptote + (old_state - asymptote) * decay_state
+    new_tangent_state = (
+        decay_state * tangent_state + (1.0 - decay_state) * tangent_field
+    )
+    counts = np.zeros(old_state.shape, dtype=int)
+    weighted_counts = np.zeros(old_state.shape, dtype=float)
+    tangent_counts = np.zeros(old_state.shape, dtype=float)
+
+    active = (asymptote > threshold) & (old_state < threshold)
+    for sample in np.flatnonzero(active):
+        level = asymptote[sample]
+        first = np.log(
+            (level - old_state[sample]) / (level - threshold)
+        )
+        if first > dt:
+            continue
+        flow_tangent = (
+            np.exp(-first) * tangent_state[sample]
+            + (1.0 - np.exp(-first)) * tangent_field[sample]
+        )
+        tangent_first = -flow_tangent / (level - threshold)
+        period = np.log((level - reset) / (level - threshold))
+        tangent_period = (
+            1.0 / (level - reset) - 1.0 / (level - threshold)
+        ) * tangent_field[sample]
+        count = 1 + int(np.floor(max(dt - first, 0.0) / period))
+        event_index = np.arange(count)
+        event_times = first + event_index * period
+        tangent_times = tangent_first + event_index * tangent_period
+        event_weights = np.exp(-beta * (dt - event_times))
+        weighted_counts[sample] = np.sum(event_weights)
+        tangent_counts[sample] = np.sum(
+            beta * event_weights * tangent_times
+        )
+        last = event_times[-1]
+        tangent_last = tangent_times[-1]
+        remaining_decay = np.exp(-(dt - last))
+        new_state[sample] = level + (reset - level) * remaining_decay
+        new_tangent_state[sample] = (
+            (1.0 - remaining_decay) * tangent_field[sample]
+            + (reset - level) * remaining_decay * tangent_last
+        )
+        counts[sample] = count
+
+    return (
+        new_state,
+        new_tangent_state,
+        weighted_counts,
+        tangent_counts,
+        counts,
+    )
+
+
+def _lif_network_tangent_step(
+    state,
+    recurrent_field,
+    tangent_state,
+    tangent_field,
+    weights,
+    I,
+    beta,
+    dt,
+):
+    """Advance the exact LIF network event map and its saltation Jacobian."""
+    (
+        new_state,
+        new_tangent_state,
+        weighted_counts,
+        tangent_counts,
+        counts,
+    ) = _lif_event_tangent_step(
+        state,
+        recurrent_field,
+        tangent_state,
+        tangent_field,
+        I,
+        beta,
+        dt,
+    )
+    decay = np.exp(-beta * dt)
+    new_field = decay * recurrent_field + beta * (weights @ weighted_counts)
+    new_tangent_field = decay * tangent_field + beta * (weights @ tangent_counts)
+    return new_state, new_field, new_tangent_state, new_tangent_field, counts
+
+
+def maximal_lyapunov_phase_network(
+    N=256,
+    I=1.0,
+    alpha=1.0,
+    sigma=7.0,
+    beta=1.0,
+    T=500.0,
+    dt=0.01,
+    burn=200.0,
+    renormalization_time=0.25,
+    perturbation=1e-6,
+    lam=1,
+    phase_model="theta",
+    seed=1234,
+    return_diagnostics=False,
+):
+    """Estimate the maximal Lyapunov exponent of the discretized event map.
+
+    For transformed theta and LIF models, the exact Jacobian of the numerical
+    event map includes the derivative of each within-step spike time (the
+    discrete saltation term). Other models use a same-disorder two-replica fallback.
+    The tangent or replica separation is periodically rescaled with the
+    standard Benettin algorithm.
+    """
+    if T <= 0.0 or dt <= 0.0 or burn < 0.0:
+        raise ValueError("T and dt must be positive and burn nonnegative")
+    if perturbation <= 0.0 or renormalization_time <= 0.0:
+        raise ValueError("perturbation and renormalization_time must be positive")
+
+    rng_local = np.random.default_rng(seed)
+    weights = make_weights(N, sigma, lam, rng_local)
+    reset, threshold, circular = _state_geometry(phase_model)
+    state = rng_local.uniform(reset, threshold, N)
+    field = np.zeros(N)
+    for _ in range(int(round(burn / dt))):
+        state, field, _ = _phase_network_step(
+            state, field, weights, I, alpha, beta, dt, phase_model
+        )
+
+    direction = rng_local.normal(size=2 * N)
+    direction /= np.sqrt(np.mean(direction**2))
+    theta_tangent = (
+        isinstance(phase_model, str)
+        and phase_model.lower() in ("theta", "transformed_theta", "transformed-theta")
+    )
+    lif_tangent = (
+        isinstance(phase_model, str)
+        and phase_model.lower()
+        in ("lif", "leaky_integrate_and_fire", "leaky-integrate-and-fire")
+    )
+    analytic_tangent = theta_tangent or lif_tangent
+    tangent_state = perturbation * direction[:N]
+    tangent_field = perturbation * direction[N:]
+    replica_state = state + perturbation * direction[:N]
+    if circular:
+        replica_state = (
+            (replica_state - reset) % (threshold - reset)
+        ) + reset
+    replica_field = field + perturbation * direction[N:]
+
+    interval_steps = max(1, int(round(renormalization_time / dt)))
+    n_intervals = max(1, int(np.floor(T / (interval_steps * dt))))
+    local_exponents = np.empty(n_intervals)
+    event_rates = np.empty(n_intervals)
+    cycle = threshold - reset
+
+    for interval in range(n_intervals):
+        event_count = 0
+        for _ in range(interval_steps):
+            if theta_tangent:
+                (
+                    state,
+                    field,
+                    tangent_state,
+                    tangent_field,
+                    counts,
+                ) = _theta_network_tangent_step(
+                    state,
+                    field,
+                    tangent_state,
+                    tangent_field,
+                    weights,
+                    I,
+                    beta,
+                    dt,
+                )
+            elif lif_tangent:
+                (
+                    state,
+                    field,
+                    tangent_state,
+                    tangent_field,
+                    counts,
+                ) = _lif_network_tangent_step(
+                    state,
+                    field,
+                    tangent_state,
+                    tangent_field,
+                    weights,
+                    I,
+                    beta,
+                    dt,
+                )
+            else:
+                state, field, counts = _phase_network_step(
+                    state, field, weights, I, alpha, beta, dt, phase_model
+                )
+                replica_state, replica_field, _ = _phase_network_step(
+                    replica_state,
+                    replica_field,
+                    weights,
+                    I,
+                    alpha,
+                    beta,
+                    dt,
+                    phase_model,
+                )
+            event_count += int(np.sum(counts))
+
+        if analytic_tangent:
+            state_difference = tangent_state
+            field_difference = tangent_field
+        else:
+            state_difference = replica_state - state
+            if circular:
+                state_difference = (
+                    (state_difference + 0.5 * cycle) % cycle
+                ) - 0.5 * cycle
+            field_difference = replica_field - field
+        difference = np.concatenate((state_difference, field_difference))
+        distance = float(np.sqrt(np.mean(difference**2)))
+        elapsed = interval_steps * dt
+        if not np.isfinite(distance) or distance <= 1e-300:
+            local_exponents[interval] = -np.inf
+            direction = rng_local.normal(size=2 * N)
+            direction /= np.sqrt(np.mean(direction**2))
+        else:
+            local_exponents[interval] = np.log(distance / perturbation) / elapsed
+            direction = difference / distance
+        tangent_state = perturbation * direction[:N]
+        tangent_field = perturbation * direction[N:]
+        if not analytic_tangent:
+            replica_state = state + tangent_state
+            if circular:
+                replica_state = (
+                    (replica_state - reset) % cycle
+                ) + reset
+            replica_field = field + tangent_field
+        event_rates[interval] = event_count / (N * elapsed)
+
+    finite = np.isfinite(local_exponents)
+    exponent = (
+        float(np.mean(local_exponents[finite])) if np.any(finite) else -np.inf
+    )
+    if not return_diagnostics:
+        return exponent
+    return exponent, dict(
+        local_exponents=local_exponents,
+        event_rates=event_rates,
+        mean_rate=float(np.mean(event_rates)),
+        dt=float(dt),
+        perturbation=float(perturbation),
+        renormalization_time=interval_steps * dt,
+        phase_model=(phase_model if isinstance(phase_model, str) else "callable"),
+    )
 
 
 def _theory_phase_scalar_autocorr(
@@ -416,27 +931,75 @@ def _phase_spike_spectrum(
     dt,
     initial_phase,
     phase_bin_width=None,
+    phase_model="power",
+    warmup_cycles=0,
+    filter_beta=None,
 ):
-    """Advect phase trajectories and return their centered spike spectrum."""
+    """Advect paths and return a spike or exact filtered-event spectrum."""
     n_samples, n_time = drive.shape
     phase = np.asarray(initial_phase, dtype=float).copy()
+    synapse = np.zeros(n_samples)
+    filter_decay = None
+    if filter_beta is not None:
+        filter_beta = float(filter_beta)
+        filter_decay = np.exp(-filter_beta * dt)
+    for _ in range(int(max(0, warmup_cycles))):
+        for k in range(n_time):
+            old_phase = phase.copy()
+            phase, spike_count, displacement = _advance_phase(
+                old_phase, drive[:, k], I, alpha, dt, model=phase_model
+            )
+            if filter_beta is not None:
+                event_weight = _filtered_event_counts(
+                    old_phase,
+                    displacement,
+                    spike_count,
+                    filter_beta,
+                    dt,
+                    model=phase_model,
+                    I=I,
+                    u=drive[:, k],
+                )
+                synapse = filter_decay * synapse + filter_beta * event_weight
+
     counts = np.zeros((n_samples, n_time), dtype=np.float32)
+    filtered_flux = (
+        np.zeros((n_samples, n_time), dtype=np.float32)
+        if filter_beta is not None
+        else None
+    )
+    reset, threshold, _circular = _state_geometry(phase_model)
+    state_span = threshold - reset
     density = None
     if phase_bin_width is not None:
         phase_bin_width = float(phase_bin_width)
-        if not 0.0 < phase_bin_width <= 2.0 * np.pi:
-            raise ValueError("phase_bin_width must lie in (0, 2*pi]")
+        if not 0.0 < phase_bin_width <= state_span:
+            raise ValueError("phase_bin_width must not exceed the state span")
         density = np.zeros((n_samples, n_time), dtype=np.float32)
 
     for k in range(n_time):
-        velocity = alpha * np.clip(I + drive[:, k], 0.0, 1e12) ** (1.0 / alpha)
-        phase += velocity * dt
-        spike_count = np.floor((phase + np.pi) / (2.0 * np.pi))
-        spiking = spike_count > 0.0
-        phase[spiking] = ((phase[spiking] + np.pi) % (2.0 * np.pi)) - np.pi
+        old_phase = phase.copy()
+        phase, spike_count, displacement = _advance_phase(
+            old_phase, drive[:, k], I, alpha, dt, model=phase_model
+        )
         counts[:, k] = spike_count
+        if filter_beta is not None:
+            event_weight = _filtered_event_counts(
+                old_phase,
+                displacement,
+                spike_count,
+                filter_beta,
+                dt,
+                model=phase_model,
+                I=I,
+                u=drive[:, k],
+            )
+            synapse = filter_decay * synapse + filter_beta * event_weight
+            filtered_flux[:, k] = synapse
         if density is not None:
-            density[:, k] = (phase >= np.pi - phase_bin_width) / phase_bin_width
+            density[:, k] = (
+                phase >= threshold - phase_bin_width
+            ) / phase_bin_width
 
     rate = counts.astype(float) / dt
     sample_mean_rates = np.mean(rate, axis=1)
@@ -445,10 +1008,14 @@ def _phase_spike_spectrum(
     # removes its finite-window DC error, matching the per-neuron temporal
     # centering used by sim_phase_network and preventing that error from being
     # amplified by the slow synaptic mode.
-    centered_rate = rate - np.mean(rate, axis=1, keepdims=True)
-    transformed = np.fft.rfft(centered_rate, axis=1)
+    spectral_signal = rate if filtered_flux is None else filtered_flux.astype(float)
+    spectral_signal -= np.mean(spectral_signal, axis=1, keepdims=True)
+    transformed = np.fft.rfft(spectral_signal, axis=1)
     spectrum = np.mean(np.abs(transformed) ** 2, axis=0) / n_time
-    covariance = np.fft.irfft(spectrum, n=n_time)
+    centered_rate = rate - np.mean(rate, axis=1, keepdims=True)
+    transformed_rate = np.fft.rfft(centered_rate, axis=1)
+    rate_spectrum = np.mean(np.abs(transformed_rate) ** 2, axis=0) / n_time
+    covariance = np.fft.irfft(rate_spectrum, n=n_time)
     density_covariance = None
     if density is not None:
         density -= np.mean(density, axis=1, keepdims=True)
@@ -480,13 +1047,15 @@ def theory_phase_density_autocorr(
     seed=1729,
     return_diagnostics=False,
     phase_bin_width=0.25,
+    phase_model="power",
+    path_warmup_cycles=None,
 ):
     """Stationary event-DMFT closure of the Gaussian 2PI drive equation.
 
     For a trial C11, Gaussian single-site drives are synthesized in Fourier
     space.  The deterministic phase density is then advected through each
-    drive, producing the complete spike covariance.  Filtering that covariance
-    with beta/(beta+i*omega) closes a C11 -> R_off -> C11 loop.
+    drive. Exact event times are propagated through the synaptic filter, closing
+    a C11 -> filtered-event covariance -> C11 loop.
     The binned spike covariance contains the exact same-event contribution as
     well as the distinct-return peaks generated by C33 transport.
 
@@ -513,18 +1082,22 @@ def theory_phase_density_autocorr(
     normals[:, 0] = 0.0
     if n_time % 2 == 0:
         normals[:, -1] = rng_local.normal(size=n_samples)
-    initial_phase = rng_local.uniform(-np.pi, np.pi, n_samples)
+    reset, threshold, circular = _state_geometry(phase_model)
+    if path_warmup_cycles is None:
+        path_warmup_cycles = 0 if circular else 2
+    path_warmup_cycles = int(max(0, path_warmup_cycles))
+    initial_phase = rng_local.uniform(reset, threshold, n_samples)
     static_normals = rng_local.normal(size=n_samples)
 
-    omega = 2.0 * np.pi * np.fft.rfftfreq(n_time, d=dt)
-    decay = np.exp(-beta * dt)
-    # The spike spectrum is formed from binned rates.  This is the exact
-    # transfer function of u[k+1]=decay*u[k]+beta*dt*s[k]; it converges to
-    # beta**2/(beta**2+omega**2) and preserves the same-event cusp at finite dt.
-    synaptic_filter = (beta * dt) ** 2 / np.maximum(
-        1.0 + decay**2 - 2.0 * decay * np.cos(omega * dt), 1e-30
-    )
-    baseline_rate = alpha * max(float(I), 0.0) ** (1.0 / alpha) / (2.0 * np.pi)
+    if circular:
+        zero_velocity = phase_velocity(
+            np.asarray([0.0]), np.asarray([0.0]), I, alpha, phase_model
+        )[0]
+        baseline_rate = zero_velocity / (threshold - reset)
+    elif I > threshold:
+        baseline_rate = 1.0 / np.log((I - reset) / (I - threshold))
+    else:
+        baseline_rate = 0.0
     circular_lag = np.minimum(np.arange(n_time), n_time - np.arange(n_time)) * dt
     # Numerical initial iterate only: filtering the exact same-event
     # covariance sigma**2 * baseline_rate * delta(tau) gives this exponential.
@@ -546,10 +1119,17 @@ def theory_phase_density_autocorr(
         drive += np.sqrt(max(static_variance, 0.0)) * static_normals[:, None]
         spike_spectrum, spike_covariance, mean_rate, sample_mean_rates, _ = (
             _phase_spike_spectrum(
-            drive, I, alpha, dt, initial_phase
+                drive,
+                I,
+                alpha,
+                dt,
+                initial_phase,
+                phase_model=phase_model,
+                warmup_cycles=path_warmup_cycles,
+                filter_beta=beta,
             )
         )
-        proposed = np.maximum(sigma**2 * synaptic_filter * spike_spectrum, 0.0)
+        proposed = np.maximum(sigma**2 * spike_spectrum, 0.0)
         proposed[0] = 0.0
         proposed_static = sigma**2 * float(np.var(sample_mean_rates))
         dynamic_scale = float(np.linalg.norm(drive_spectrum))
@@ -576,7 +1156,7 @@ def theory_phase_density_autocorr(
     n_lag = int(tau_max / dtau)
     tau = np.arange(n_lag) * dtau
     result = np.interp(tau, internal_tau, covariance[:max_internal_lag])
-    sigma_c = _phase_sigma_c(I, alpha)
+    sigma_c = _phase_sigma_c(I, alpha) if _uses_legacy_power_model(phase_model) else np.nan
     if not return_diagnostics:
         return tau, result, sigma_c
 
@@ -599,6 +1179,9 @@ def theory_phase_density_autocorr(
         dt,
         initial_phase,
         phase_bin_width=phase_bin_width,
+        phase_model=phase_model,
+        warmup_cycles=path_warmup_cycles,
+        filter_beta=beta,
     )
 
     same_event = mean_rate / dt
@@ -616,12 +1199,204 @@ def theory_phase_density_autocorr(
         static_variance=static_variance,
         phase_bin_width=float(phase_bin_width),
         phase_density_covariance=phase_density_covariance,
+        phase_model=(phase_model if isinstance(phase_model, str) else "callable"),
+        path_warmup_cycles=path_warmup_cycles,
     )
     return tau, result, sigma_c, diagnostics
 
 
-def _phase_twotime_paths(drive, initial_phase, I, alpha, beta, dt, phase_bin_width):
-    """Propagate the effective phase process and its filtered threshold flux."""
+def phase_replica_stability_dmft(
+    I=1.0,
+    alpha=1.0,
+    sigma=7.0,
+    beta=1.0,
+    internal_dt=0.02,
+    n_time=8192,
+    n_samples=96,
+    fixed_point_iterations=40,
+    fixed_point_mixing=0.18,
+    fixed_point_tolerance=0.03,
+    power_iterations=8,
+    covariance_perturbation=1e-3,
+    phase_model="theta",
+    path_warmup_cycles=None,
+    seed=481516,
+    return_diagnostics=False,
+):
+    """Compute the leading two-replica DMFT covariance-map multiplier.
+
+    The one-replica event-DMFT fixed point supplies the auto-spectrum ``S``.
+    A Gaussian tangent drive with covariance ``D`` is propagated through the
+    exact linearization of the transformed-theta or LIF event process. The covariance
+    of the resulting tangent flux defines the new ``D``. Power iteration is
+    therefore the numerical Frechet derivative at synchronized replicas,
+    without differencing two binned spike trains.
+    A leading multiplier above one signals loss of replica synchronization.
+    """
+    model_key = str(phase_model).lower() if isinstance(phase_model, str) else ""
+    if model_key not in (
+        "theta",
+        "transformed_theta",
+        "transformed-theta",
+        "lif",
+        "leaky_integrate_and_fire",
+        "leaky-integrate-and-fire",
+    ):
+        raise NotImplementedError(
+            "analytic replica stability supports transformed theta and LIF"
+        )
+    lif_model = model_key in (
+        "lif",
+        "leaky_integrate_and_fire",
+        "leaky-integrate-and-fire",
+    )
+    if path_warmup_cycles is None:
+        path_warmup_cycles = 2 if lif_model else 0
+    if covariance_perturbation <= 0.0:
+        raise ValueError("covariance_perturbation must be positive")
+    if sigma == 0.0:
+        result = 0.0
+        if not return_diagnostics:
+            return result
+        return result, dict(
+            converged=True,
+            multiplier_history=np.zeros(1),
+            drive_spectrum=np.zeros(int(n_time) // 2 + 1),
+        )
+
+    _, _, _, fixed_point = theory_phase_density_autocorr(
+        I=I,
+        alpha=alpha,
+        sigma=sigma,
+        beta=beta,
+        tau_max=max(2.0, 10.0 * internal_dt),
+        dtau=internal_dt,
+        internal_dt=internal_dt,
+        n_time=n_time,
+        n_samples=n_samples,
+        max_iter=fixed_point_iterations,
+        mixing=fixed_point_mixing,
+        tolerance=fixed_point_tolerance,
+        seed=seed,
+        return_diagnostics=True,
+        phase_model=phase_model,
+        path_warmup_cycles=path_warmup_cycles,
+    )
+    auto_spectrum = np.maximum(
+        np.asarray(fixed_point["drive_spectrum"], dtype=float), 0.0
+    )
+    auto_spectrum[0] = 0.0
+    total_power = float(np.sum(auto_spectrum))
+    if total_power <= 1e-20:
+        result = 0.0
+        if not return_diagnostics:
+            return result
+        return result, dict(
+            converged=fixed_point["converged"],
+            multiplier_history=np.zeros(1),
+            drive_spectrum=auto_spectrum,
+            fixed_point=fixed_point,
+        )
+
+    n_time = int(n_time)
+    n_samples = int(n_samples)
+    n_freq = n_time // 2 + 1
+    rng_local = np.random.default_rng(seed + 1)
+
+    def complex_normals():
+        values = (
+            rng_local.normal(size=(n_samples, n_freq))
+            + 1j * rng_local.normal(size=(n_samples, n_freq))
+        ) / np.sqrt(2.0)
+        values[:, 0] = 0.0
+        if n_time % 2 == 0:
+            values[:, -1] = rng_local.normal(size=n_samples)
+        return values
+
+    base_normals = complex_normals()
+    tangent_normals = complex_normals()
+    reset, threshold, _circular = _state_geometry(phase_model)
+    initial_state = rng_local.uniform(reset, threshold, n_samples)
+    drive = _gaussian_process_from_spectrum(
+        auto_spectrum, base_normals, n_time
+    )
+    target_power = covariance_perturbation * total_power
+    deficit = covariance_perturbation * auto_spectrum
+    multiplier_history = []
+    shape_history = []
+
+    for _ in range(int(max(1, power_iterations))):
+        deficit = np.minimum(deficit, 0.25 * auto_spectrum)
+        deficit[0] = 0.0
+        input_power = float(np.sum(deficit))
+        if input_power <= 1e-30:
+            break
+        tangent_drive = _gaussian_process_from_spectrum(
+            deficit, tangent_normals, n_time
+        )
+        if lif_model:
+            _, tangent_flux = _lif_twotime_tangent_flux(
+                drive,
+                tangent_drive,
+                initial_state,
+                I,
+                beta,
+                internal_dt,
+                warmup_cycles=path_warmup_cycles,
+            )
+        else:
+            _, tangent_flux = _theta_twotime_tangent_flux(
+                drive,
+                tangent_drive,
+                initial_state,
+                I,
+                beta,
+                internal_dt,
+            )
+        tangent_flux -= np.mean(tangent_flux, axis=1, keepdims=True)
+        transformed = np.fft.rfft(tangent_flux, axis=1)
+        output_deficit = (
+            sigma**2
+            * np.mean(np.abs(transformed) ** 2, axis=0)
+            / n_time
+        )
+        output_deficit[0] = 0.0
+        output_power = float(np.sum(output_deficit))
+        multiplier_history.append(output_power / input_power)
+        if output_power <= 1e-30:
+            deficit = np.zeros_like(deficit)
+            break
+        shape_history.append(output_deficit / output_power)
+        deficit = target_power * output_deficit / output_power
+
+    multipliers = np.asarray(multiplier_history, dtype=float)
+    result = float(multipliers[-1]) if len(multipliers) else 0.0
+    if not return_diagnostics:
+        return result
+    return result, dict(
+        converged=bool(fixed_point["converged"]),
+        multiplier_history=multipliers,
+        drive_spectrum=auto_spectrum,
+        final_deficit=deficit,
+        shape_history=np.asarray(shape_history),
+        covariance_perturbation=float(covariance_perturbation),
+        fixed_point=fixed_point,
+        phase_model=(phase_model if isinstance(phase_model, str) else "callable"),
+        path_warmup_cycles=int(path_warmup_cycles),
+    )
+
+
+def _phase_twotime_paths(
+    drive,
+    initial_phase,
+    I,
+    alpha,
+    beta,
+    dt,
+    phase_bin_width,
+    phase_model="power",
+):
+    """Propagate a threshold-reset process and its filtered event flux."""
     n_samples, n_time = drive.shape
     phase = np.asarray(initial_phase, dtype=float).copy()
     phases = np.empty((n_samples, n_time), dtype=np.float32)
@@ -630,37 +1405,161 @@ def _phase_twotime_paths(drive, initial_phase, I, alpha, beta, dt, phase_bin_wid
     velocity_derivative = np.zeros_like(drive)
     synapse = np.zeros(n_samples)
     decay = np.exp(-beta * dt)
+    _reset, threshold, _circular = _state_geometry(phase_model)
 
     for k in range(n_time):
-        total_drive = I + drive[:, k]
-        positive = total_drive > 0.0
-        velocity = np.zeros(n_samples)
-        velocity[positive] = (
-            alpha * total_drive[positive] ** (1.0 / alpha)
-        )
-        velocity_derivative[positive, k] = (
-            total_drive[positive] ** (1.0 / alpha - 1.0)
+        velocity_derivative[:, k] = phase_input_gain(
+            phase,
+            I=I,
+            alpha=alpha,
+            u=drive[:, k],
+            model=phase_model,
         )
         old_phase = phase.copy()
-        unwrapped = old_phase + velocity * dt
-        counts = np.floor((unwrapped + np.pi) / (2.0 * np.pi)).astype(int)
-        spiking = counts > 0
-        phase = ((unwrapped + np.pi) % (2.0 * np.pi)) - np.pi
-
-        weighted_counts = np.zeros(n_samples)
-        for sample in np.flatnonzero(spiking):
-            thresholds = np.pi + 2.0 * np.pi * np.arange(counts[sample])
-            crossing_times = (thresholds - old_phase[sample]) / velocity[sample]
-            crossing_times = np.clip(crossing_times, 0.0, dt)
-            weighted_counts[sample] = np.sum(
-                np.exp(-beta * (dt - crossing_times))
-            )
+        phase, counts, displacement = _advance_phase(
+            old_phase, drive[:, k], I, alpha, dt, model=phase_model
+        )
+        weighted_counts = _filtered_event_counts(
+            old_phase,
+            displacement,
+            counts,
+            beta,
+            dt,
+            model=phase_model,
+            I=I,
+            u=drive[:, k],
+        )
         synapse = decay * synapse + beta * weighted_counts
         filtered_flux[:, k] = synapse
         phases[:, k] = phase
-        density[:, k] = (phase >= np.pi - phase_bin_width) / phase_bin_width
+        density[:, k] = (
+            phase >= threshold - phase_bin_width
+        ) / phase_bin_width
 
     return phases, density, filtered_flux, velocity_derivative
+
+
+def _theta_twotime_tangent_flux(
+    drive,
+    tangent_drive,
+    initial_phase,
+    I,
+    beta,
+    dt,
+):
+    """Linearize the filtered event flux along transformed-theta paths."""
+    n_samples, n_time = drive.shape
+    phase = np.asarray(initial_phase, dtype=float).copy()
+    tangent_phase = np.zeros(n_samples)
+    filtered_flux = np.zeros_like(drive)
+    tangent_flux = np.zeros_like(drive)
+    synapse = np.zeros(n_samples)
+    tangent_synapse = np.zeros(n_samples)
+    decay = np.exp(-beta * dt)
+    root_I = np.sqrt(float(I))
+
+    for k in range(n_time):
+        field = drive[:, k]
+        field_tangent = tangent_drive[:, k]
+        old_phase = phase.copy()
+        old_tangent = tangent_phase.copy()
+        velocity_0 = phase_velocity(old_phase, field, I=I, model="theta")
+        tangent_velocity_0 = (
+            -np.sin(old_phase) * field * old_tangent / root_I
+            + (1.0 + np.cos(old_phase)) * field_tangent / root_I
+        )
+        midpoint = old_phase + 0.5 * dt * velocity_0
+        tangent_midpoint = old_tangent + 0.5 * dt * tangent_velocity_0
+        velocity_mid = phase_velocity(midpoint, field, I=I, model="theta")
+        tangent_velocity_mid = (
+            -np.sin(midpoint) * field * tangent_midpoint / root_I
+            + (1.0 + np.cos(midpoint)) * field_tangent / root_I
+        )
+        unwrapped = old_phase + dt * velocity_mid
+        tangent_unwrapped = old_tangent + dt * tangent_velocity_mid
+        counts = np.maximum(
+            np.floor((unwrapped + np.pi) / (2.0 * np.pi)).astype(int), 0
+        )
+        phase = ((unwrapped + np.pi) % (2.0 * np.pi)) - np.pi
+        tangent_phase = tangent_unwrapped
+
+        displacement = unwrapped - old_phase
+        tangent_displacement = tangent_unwrapped - old_tangent
+        event_weight = np.zeros(n_samples)
+        tangent_event_weight = np.zeros(n_samples)
+        for sample in np.flatnonzero(counts > 0):
+            if displacement[sample] <= 0.0:
+                continue
+            thresholds = np.pi + 2.0 * np.pi * np.arange(counts[sample])
+            numerator = thresholds - old_phase[sample]
+            crossing_times = dt * numerator / displacement[sample]
+            tangent_times = dt * (
+                -old_tangent[sample] * displacement[sample]
+                - numerator * tangent_displacement[sample]
+            ) / displacement[sample] ** 2
+            weights = np.exp(-beta * (dt - crossing_times))
+            event_weight[sample] = np.sum(weights)
+            tangent_event_weight[sample] = np.sum(
+                beta * weights * tangent_times
+            )
+        synapse = decay * synapse + beta * event_weight
+        tangent_synapse = (
+            decay * tangent_synapse + beta * tangent_event_weight
+        )
+        filtered_flux[:, k] = synapse
+        tangent_flux[:, k] = tangent_synapse
+
+    return filtered_flux, tangent_flux
+
+
+def _lif_twotime_tangent_flux(
+    drive,
+    tangent_drive,
+    initial_state,
+    I,
+    beta,
+    dt,
+    warmup_cycles=2,
+):
+    """Linearize the filtered event flux along exact stationary LIF paths."""
+    n_samples, n_time = drive.shape
+    state = np.asarray(initial_state, dtype=float).copy()
+    for _ in range(int(max(0, warmup_cycles))):
+        for k in range(n_time):
+            state, _counts, _displacement = _advance_phase(
+                state, drive[:, k], I, 1.0, dt, model="lif"
+            )
+
+    tangent_state = np.zeros(n_samples)
+    filtered_flux = np.zeros_like(drive)
+    tangent_flux = np.zeros_like(drive)
+    synapse = np.zeros(n_samples)
+    tangent_synapse = np.zeros(n_samples)
+    decay = np.exp(-beta * dt)
+    for k in range(n_time):
+        (
+            state,
+            tangent_state,
+            event_weight,
+            tangent_event_weight,
+            _counts,
+        ) = _lif_event_tangent_step(
+            state,
+            drive[:, k],
+            tangent_state,
+            tangent_drive[:, k],
+            I,
+            beta,
+            dt,
+        )
+        synapse = decay * synapse + beta * event_weight
+        tangent_synapse = (
+            decay * tangent_synapse + beta * tangent_event_weight
+        )
+        filtered_flux[:, k] = synapse
+        tangent_flux[:, k] = tangent_synapse
+
+    return filtered_flux, tangent_flux
 
 
 def _sample_gaussian_kernel(covariance, normals):
@@ -703,6 +1602,7 @@ def theory_phase_twotime_dmft(
     response_modes=(1, 2, 3),
     seed=271828,
     return_diagnostics=False,
+    phase_model="power",
 ):
     """Solve the nonstationary two-time event-DMFT closure.
 
@@ -721,13 +1621,14 @@ def theory_phase_twotime_dmft(
     dt = float(internal_dt)
     if dt <= 0.0 or dtau <= 0.0:
         raise ValueError("internal_dt and dtau must be positive")
-    if not 0.0 < phase_bin_width <= 2.0 * np.pi:
-        raise ValueError("phase_bin_width must lie in (0, 2*pi]")
     if not 0.0 <= transient_fraction < 1.0:
         raise ValueError("transient_fraction must lie in [0, 1)")
 
     rng_local = np.random.default_rng(seed)
-    initial_phase = rng_local.uniform(-np.pi, np.pi, n_samples)
+    reset, threshold, _circular = _state_geometry(phase_model)
+    if not 0.0 < phase_bin_width <= threshold - reset:
+        raise ValueError("phase_bin_width must not exceed the state span")
+    initial_phase = rng_local.uniform(reset, threshold, n_samples)
     normals = rng_local.normal(size=(n_samples, n_time))
     normals -= np.mean(normals, axis=0, keepdims=True)
     normals /= np.maximum(np.std(normals, axis=0, keepdims=True), 1e-12)
@@ -741,6 +1642,7 @@ def theory_phase_twotime_dmft(
         beta,
         dt,
         phase_bin_width,
+        phase_model,
     )
     centered_flux = initial_flux - np.mean(initial_flux, axis=0, keepdims=True)
     covariance = sigma**2 * centered_flux.T @ centered_flux / n_samples
@@ -757,6 +1659,7 @@ def theory_phase_twotime_dmft(
             beta,
             dt,
             phase_bin_width,
+            phase_model,
         )
         centered_flux = filtered_flux - np.mean(
             filtered_flux, axis=0, keepdims=True
@@ -782,6 +1685,7 @@ def theory_phase_twotime_dmft(
         beta,
         dt,
         phase_bin_width,
+        phase_model,
     )
     drive_centered = drive - np.mean(drive, axis=0, keepdims=True)
     density_centered = density - np.mean(density, axis=0, keepdims=True)
@@ -813,7 +1717,7 @@ def theory_phase_twotime_dmft(
     n_lag = max(1, int(tau_max / dtau))
     tau = np.arange(n_lag) * dtau
     result = np.interp(tau, internal_tau, C11_lag)
-    sigma_c = _phase_sigma_c(I, alpha)
+    sigma_c = _phase_sigma_c(I, alpha) if _uses_legacy_power_model(phase_model) else np.nan
     if not return_diagnostics:
         return tau, result, sigma_c
 
@@ -832,6 +1736,7 @@ def theory_phase_twotime_dmft(
         phase_response_modes=response,
         phases=phases,
         filtered_flux=filtered_flux,
+        phase_model=(phase_model if isinstance(phase_model, str) else "callable"),
     )
     return tau, result, sigma_c, diagnostics
 
@@ -2577,6 +3482,7 @@ def _sim_phase_timeseries(
     burn=200.0,
     synapse_update="exact",
     max_recorded_spikes_per_bin=None,
+    phase_model="power",
     rng_=None,
 ):
     """Simulate phase network and return raw u timeseries and per-neuron spike times.
@@ -2591,45 +3497,24 @@ def _sim_phase_timeseries(
         rng_ = np.random.default_rng(42)
     n_show = min(n_show, N)
     W = make_weights(N, sigma, lam=1, rng=rng_)
-    phi = rng_.uniform(-np.pi, np.pi, N)
+    reset, threshold, _circular = _state_geometry(phase_model)
+    phi = rng_.uniform(reset, threshold, N)
     u = np.zeros(N)
     synapse_update = str(synapse_update).lower()
     if synapse_update not in ("exact", "euler"):
         raise ValueError("synapse_update must be 'exact' or 'euler'")
 
-    def F(u_):
-        return alpha * np.clip(I + u_, 0.0, 1e12) ** (1.0 / alpha)
-
-    def spike_weights(phi_old, rate, spike_counts):
-        if synapse_update == "euler":
-            return spike_counts
-        weighted = np.zeros_like(spike_counts, dtype=float)
-        spiking = np.flatnonzero(spike_counts > 0)
-        for j in spiking:
-            count = int(spike_counts[j])
-            if count <= 0 or rate[j] <= 0.0:
-                continue
-            thresholds = np.pi + 2.0 * np.pi * np.arange(count)
-            crossing_times = (thresholds - phi_old[j]) / rate[j]
-            crossing_times = np.clip(crossing_times, 0.0, dt)
-            weighted[j] = np.sum(np.exp(-beta * (dt - crossing_times)))
-        return weighted
-
-    def update_u(u_, drive_):
-        if synapse_update == "exact":
-            return np.exp(-beta * dt) * u_ + beta * drive_
-        return u_ + (-beta * u_) * dt + beta * drive_
-
     nb = int(burn / dt)
     for _ in range(nb):
-        phi_old = phi.copy()
-        rate = F(u)
-        phi = phi_old + rate * dt
-        spike_counts = np.floor((phi + np.pi) / (2.0 * np.pi)).astype(float)
-        spikes = spike_counts > 0
-        phi[spikes] = ((phi[spikes] + np.pi) % (2.0 * np.pi)) - np.pi
-        drive = W @ spike_weights(phi_old, rate, spike_counts)
-        u = update_u(u, drive)
+        if synapse_update == "exact":
+            phi, u, _ = _phase_network_step(
+                phi, u, W, I, alpha, beta, dt, phase_model
+            )
+        else:
+            phi, spike_counts, _ = _advance_phase(
+                phi, u, I, alpha, dt, model=phase_model
+            )
+            u = u + (-beta * u) * dt + beta * (W @ spike_counts)
         if not np.all(np.isfinite(u)):
             u = np.nan_to_num(u, nan=0.0, posinf=1e6, neginf=-1e6)
 
@@ -2640,14 +3525,15 @@ def _sim_phase_timeseries(
     spk_times = [[] for _ in range(n_show)]
 
     for step in range(nt):
-        phi_old = phi.copy()
-        rate = F(u)
-        phi = phi_old + rate * dt
-        spike_counts = np.floor((phi + np.pi) / (2.0 * np.pi)).astype(float)
-        spikes = spike_counts > 0
-        phi[spikes] = ((phi[spikes] + np.pi) % (2.0 * np.pi)) - np.pi
-        drive = W @ spike_weights(phi_old, rate, spike_counts)
-        u = update_u(u, drive)
+        if synapse_update == "exact":
+            phi, u, spike_counts = _phase_network_step(
+                phi, u, W, I, alpha, beta, dt, phase_model
+            )
+        else:
+            phi, spike_counts, _ = _advance_phase(
+                phi, u, I, alpha, dt, model=phase_model
+            )
+            u = u + (-beta * u) * dt + beta * (W @ spike_counts)
         if not np.all(np.isfinite(u)):
             u = np.nan_to_num(u, nan=0.0, posinf=1e6, neginf=-1e6)
         U[step] = u[idx]
