@@ -60,6 +60,12 @@ def test_figure_names_match_manuscript_order():
         "fig11_phase_criticality.png",
         "fig12_phase_u_timeseries.png",
         "fig13_phase_raster.png",
+        "chaos_fig01_activity.png",
+        "chaos_fig02_lyapunov.png",
+        "chaos_fig03_replica.png",
+        "chaos_fig04_covariances.png",
+        "chaos_fig05_lif.png",
+        "lif_fp_quadrature_benchmark.png",
     )
 
 

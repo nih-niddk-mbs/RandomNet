@@ -6,6 +6,8 @@ isolated temporary folder. The active theory paths are:
   * rate SCS
   * phase-density DMFT with threshold returns and finite-size convergence
   * binary sigmoid-network DMFT and its controlled affine tangent limit
+  * transformed-theta and LIF covariance, Lyapunov, and replica calculations
+  * prescribed-drive first-passage and return-operator diagnostics
 
 Use ``--profile quick`` for a transient smoke run and ``--profile paper`` for
 the publication calculations.
@@ -50,6 +52,8 @@ from rn_binary import (  # noqa: E402
     plot_binary_network_N_convergence,
     plot_binary_theory_hierarchy,
 )
+from make_chaos_figures import CHAOS_FIGURE_FILES, make_chaos_figures  # noqa: E402
+from benchmark_lif_fp import run_lif_fp_benchmark  # noqa: E402
 
 
 PHASE_SCALAR_THEORY = dict(
@@ -73,6 +77,8 @@ PAPER_FIGURE_FILES = (
     "fig11_phase_criticality.png",
     "fig12_phase_u_timeseries.png",
     "fig13_phase_raster.png",
+    *CHAOS_FIGURE_FILES,
+    "lif_fp_quadrature_benchmark.png",
 )
 
 PAPER_FIGURE_GROUPS = (
@@ -89,6 +95,8 @@ PAPER_FIGURE_GROUPS = (
     "binary",
     "binary-conv",
     "binary-hierarchy",
+    "chaos",
+    "first-passage",
 )
 
 
@@ -451,6 +459,20 @@ def make_figures(profile: str, figures: set[str], plot_dir: Path, jobs: int) -> 
             plot_dir=str(plot_dir),
         )
         _copy_named(plot_dir, "binary_theory_hierarchy.png", "fig04_binary_hierarchy.png", manifest)
+
+    if "chaos" in figures:
+        print("\n[chaos] transformed-theta and LIF stability calculations")
+        produced = make_chaos_figures(
+            profile=profile,
+            output_dir=plot_dir,
+            jobs=max(1, jobs),
+        )
+        manifest.extend(Path(path).name for path in produced)
+
+    if "first-passage" in figures:
+        print("\n[first-passage] LIF quadrature and return-operator benchmark")
+        produced = run_lif_fp_benchmark(profile=profile, output_dir=plot_dir)
+        manifest.append(Path(produced).name)
 
     inventory = [name for name in PAPER_FIGURE_FILES if (plot_dir / name).exists()]
     readme = plot_dir / "MANIFEST.txt"
