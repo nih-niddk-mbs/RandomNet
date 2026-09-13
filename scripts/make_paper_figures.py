@@ -3,7 +3,7 @@
 Paper runs write to the configured external results folder; quick runs use an
 isolated temporary folder. The active theory paths are:
 
-  * rate SCS
+  * nonlinear conductance-based rate DMFT
   * phase-density DMFT with threshold returns and finite-size convergence
   * binary sigmoid-network DMFT and its controlled affine tangent limit
   * transformed-theta and LIF covariance, Lyapunov, and replica calculations
@@ -34,7 +34,7 @@ if str(SCRIPTS) not in sys.path:
     sys.path.insert(0, str(SCRIPTS))
 
 from rn_core import default_results_dir  # noqa: E402
-from rn_rate import plot_rate_network  # noqa: E402
+from rn_rate import plot_nonlinear_rate_monte_carlo_q  # noqa: E402
 from rn_phase import (  # noqa: E402
     plot_phase_beta_scaling_diagnostic,
     plot_phase_network_N_convergence,
@@ -64,7 +64,7 @@ PHASE_SCALAR_THEORY = dict(
 )
 
 PAPER_FIGURE_FILES = (
-    "fig01_rate_scs.png",
+    "fig01_rate_nonlinear.png",
     "fig02_binary_sigmoid.png",
     "fig03_binary_N_convergence.png",
     "fig04_binary_hierarchy.png",
@@ -191,7 +191,6 @@ def make_figures(profile: str, figures: set[str], plot_dir: Path, jobs: int) -> 
     manifest: list[str] = []
     quick = profile == "quick"
 
-    rate_N = 384 if quick else 1536
     phase_N = 128 if quick else 256
     binary_N = 128 if quick else 800
     phase_T = 450.0 if quick else 900.0
@@ -218,18 +217,24 @@ def make_figures(profile: str, figures: set[str], plot_dir: Path, jobs: int) -> 
     ]
 
     if "rate" in figures:
-        print("\n[fig01] rate SCS baseline")
-        plot_rate_network(
-            sigma=2.2,
-            N=rate_N,
-            C0_guess=0.8,
-            T=350.0 if quick else 1800.0,
-            burn=100.0 if quick else 400.0,
-            n_probe=192 if quick else 768,
-            sim_reps=2 if quick else 5,
+        print("\n[fig01] nonlinear conductance-based rate DMFT")
+        plot_nonlinear_rate_monte_carlo_q(
+            sigma=1.6,
+            N=192 if quick else 768,
+            T=120.0 if quick else 400.0,
+            burn=60.0 if quick else 200.0,
+            dt=0.025,
+            tau_max=8.0 if quick else 12.0,
+            sim_reps=1 if quick else 4,
+            representative_reps=1 if quick else 4,
+            representative_samples=16 if quick else 1024,
+            picard_reps=1 if quick else 4,
+            picard_samples=16 if quick else 768,
+            picard_n_time=1024 if quick else 8192,
+            n_probe=96 if quick else 384,
             plot_dir=str(plot_dir),
         )
-        _copy_named(plot_dir, "rate_network_test.png", "fig01_rate_scs.png", manifest)
+        _copy_named(plot_dir, "nonlinear_rate_network.png", "fig01_rate_nonlinear.png", manifest)
 
     if "phase-theory" in figures:
         print("\n[fig06] two-time and stationary event-DMFT examples")

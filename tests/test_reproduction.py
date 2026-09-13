@@ -6,6 +6,7 @@ ROOT = Path(__file__).resolve().parents[1]
 sys.path.insert(0, str(ROOT / "scripts"))
 
 import make_paper_figures  # noqa: E402
+import numpy as np
 from make_paper_figures import (  # noqa: E402
     PAPER_FIGURE_FILES,
     PAPER_FIGURE_GROUPS,
@@ -13,6 +14,11 @@ from make_paper_figures import (  # noqa: E402
     resolve_output_dir,
 )
 from rn_core import default_results_dir  # noqa: E402
+from rn_rate import (  # noqa: E402
+    nonlinear_rate_fixed_q_response,
+    sim_nonlinear_rate_network,
+    theory_nonlinear_rate_dmft,
+)
 
 
 def test_results_environment_override_is_respected(monkeypatch, tmp_path):
@@ -47,7 +53,7 @@ def test_explicit_output_directory_has_priority(tmp_path):
 
 def test_figure_names_match_manuscript_order():
     assert PAPER_FIGURE_FILES == (
-        "fig01_rate_scs.png",
+        "fig01_rate_nonlinear.png",
         "fig02_binary_sigmoid.png",
         "fig03_binary_N_convergence.png",
         "fig04_binary_hierarchy.png",
@@ -72,6 +78,54 @@ def test_figure_names_match_manuscript_order():
 def test_external_driver_can_expand_figure_groups():
     assert expand_figure_groups(["all"]) == set(PAPER_FIGURE_GROUPS)
     assert expand_figure_groups(["rate", "binary"]) == {"rate", "binary"}
+
+
+def test_nonlinear_rate_simulation_and_dmft_are_finite():
+    tau_sim, simulation, _ = sim_nonlinear_rate_network(
+        N=24,
+        sigma=1.3,
+        T=4.0,
+        burn=2.0,
+        dt=0.05,
+        n_probe=8,
+        tau_max=1.0,
+        rng=np.random.default_rng(123),
+    )
+    tau_theory, theory, diagnostics = theory_nonlinear_rate_dmft(
+        sigma=1.3,
+        internal_dt=0.05,
+        n_time=256,
+        n_samples=4,
+        warmup_cycles=1,
+        max_iter=2,
+        tau_max=1.0,
+        return_diagnostics=True,
+    )
+
+    assert tau_sim.shape == simulation["Cuu"].shape
+    assert tau_theory.shape == theory["Cuu"].shape
+    assert np.all(np.isfinite(simulation["Q"]))
+    assert np.all(np.isfinite(theory["Q"]))
+    assert diagnostics["sigma_critical_linear"] == 1.0
+
+
+def test_nonlinear_rate_fixed_q_response_keeps_input_and_output_separate():
+    local_rng = np.random.default_rng(321)
+    output_paths = 0.5 + 0.05 * local_rng.normal(size=(6, 256))
+    tau, covariances, diagnostics = nonlinear_rate_fixed_q_response(
+        output_paths,
+        sigma=0.2,
+        dt=0.05,
+        n_samples=6,
+        warmup_cycles=1,
+        tau_max=0.5,
+        seed=123,
+    )
+
+    assert tau.shape == covariances["Q_in"].shape
+    assert covariances["Q_out"].shape == tau.shape
+    assert np.all(np.isfinite(covariances["Cuu"]))
+    assert diagnostics["n_samples"] == 6
 
 
 def test_phase_comparison_variants_put_two_time_theory_first():

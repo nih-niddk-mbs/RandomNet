@@ -7,7 +7,8 @@ directory rather than in this repository.
 ## Contents
 
 - `scripts/rn_core.py`: row-sum-corrected random weights and correlation helpers.
-- `scripts/rn_rate.py`: rate-network simulation and SCS closure.
+- `scripts/rn_rate.py`: nonlinear conductance-based rate-network simulation,
+  representative-path DMFT, and the scalar SCS reference calculation.
 - `scripts/rn_binary.py`: sigmoid binary-network simulation, dynamic DMFT,
   and the controlled affine-tangent benchmark.
 - `scripts/rn_phase.py`: threshold-reset simulation, stationary and full
@@ -30,10 +31,14 @@ directory rather than in this repository.
 
 ## Numerical Methods
 
-The rate theory uses deterministic tensor Gauss-Hermite quadrature for the
-Gaussian gain moment, bisection for the physical nonzero energy root, and
-first-integral reconstruction of the monotone covariance branch. There is no
-sampling noise in this calculation.
+The nonlinear rate DMFT iterates the output kernel `Q` using common stationary
+Gaussian drive paths and integrates the coupled neuronal and saturating
+synaptic variables. Its diagnostics report the spectral fixed-point residual.
+`nonlinear_rate_fixed_q_response` instead holds a kernel measured from network
+output paths fixed, allowing errors in the Gaussian single-site reduction to
+be separated from errors in the numerical self-consistency iteration.
+The scalar SCS reference calculation remains available and uses deterministic
+Gauss-Hermite quadrature and first-integral reconstruction.
 
 The binary DMFT solver samples only stationary Gaussian drive paths. For each
 drive, it integrates the conditional two-state master equation and its
@@ -165,7 +170,7 @@ NumPy arrays and do not write files. For example:
 ```python
 import numpy as np
 
-from rn_rate import sim_rate_network, theory_rate_autocorr
+from rn_rate import sim_nonlinear_rate_network, theory_nonlinear_rate_dmft
 from rn_binary import sim_binary_network, theory_binary_sigmoid_dmft
 from rn_phase import (
     maximal_lyapunov_phase_network,
@@ -173,15 +178,18 @@ from rn_phase import (
     theory_phase_autocorr,
 )
 
-# Rate model: simulation and SCS theory.
-tau_sim, C_sim = sim_rate_network(
+# Nonlinear rate model: finite network and representative-path DMFT.
+tau_sim, C_sim, sim_diagnostics = sim_nonlinear_rate_network(
     N=256,
-    sigma=1.5,
+    sigma=1.3,
     T=200.0,
     burn=50.0,
     rng=np.random.default_rng(1),
 )
-tau_theory, C_theory = theory_rate_autocorr(sigma=1.5)
+tau_theory, C_theory, theory_diagnostics = theory_nonlinear_rate_dmft(
+    sigma=1.3,
+    return_diagnostics=True,
+)
 
 # Binary model: matched sigmoid simulation and dynamic DMFT.
 tau, Cnn_sim, Cuu_sim = sim_binary_network(
@@ -241,12 +249,12 @@ directory explicitly:
 ```python
 from pathlib import Path
 
-from rn_rate import plot_rate_network
+from rn_rate import plot_nonlinear_rate_monte_carlo_q
 from rn_phase import plot_phase_density_correlation
 
 output_dir = Path("/path/to/randomnet-results")
 
-plot_rate_network(
+plot_nonlinear_rate_monte_carlo_q(
     N=384,
     T=500.0,
     burn=100.0,
@@ -267,8 +275,9 @@ PYTHONPATH=scripts python -c 'import rn_phase; help(rn_phase.theory_phase_autoco
 The principal entry points are:
 
 - `rn_core`: `make_weights`, `autocorr`, and `default_results_dir`.
-- `rn_rate`: `sim_rate_network`, `theory_rate_autocorr`, and
-  `plot_rate_network`.
+- `rn_rate`: `sim_nonlinear_rate_network`, `nonlinear_rate_fixed_q_response`,
+  `theory_nonlinear_rate_dmft`, `plot_nonlinear_rate_monte_carlo_q`, and
+  `plot_nonlinear_rate_network`; the scalar SCS functions remain available.
 - `rn_binary`: `sigmoid_rate`, `sim_binary_network`,
   `theory_binary_sigmoid_dmft`, `theory_binary_sigmoid_tangent`, and the
   binary plotting functions. `theory_binary_autocorr` is the formal affine
@@ -388,7 +397,7 @@ The driver can instead import any individual function from `rn_rate`,
 Machine-specific repository and result paths belong in this external driver or
 the environment, never in the repository.
 
-Publication figures are numbered in manuscript order: rate calibration
+Publication figures are numbered in manuscript order: nonlinear rate DMFT
 (`fig01`), sigmoid binary results (`fig02`--`fig04`), the phase closure hierarchy
 (`fig05`), two-time and stationary event-DMFT comparisons
 (`fig06`--`fig10`), the smooth-feedback transition estimate and scalar-cusp
