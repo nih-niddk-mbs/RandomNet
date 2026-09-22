@@ -9,6 +9,28 @@ from numpy.fft import fft, ifft
 rng = np.random.default_rng(42)
 
 
+def label_panels(axes, *, start=0):
+    """Add sequential journal-style labels to visible Matplotlib axes."""
+    flattened = np.asarray(axes, dtype=object).reshape(-1)
+    panel_index = int(start)
+    for axis in flattened:
+        if axis is None or not axis.get_visible():
+            continue
+        label = chr(ord("a") + panel_index)
+        axis.text(
+            0.01,
+            1.02,
+            f"({label})",
+            transform=axis.transAxes,
+            ha="left",
+            va="bottom",
+            fontsize=10,
+            fontweight="bold",
+            clip_on=False,
+        )
+        panel_index += 1
+
+
 def default_results_dir(*parts):
     """Return a writable results directory outside the repository.
 

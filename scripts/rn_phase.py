@@ -5,11 +5,31 @@ import os
 import numpy as np
 import matplotlib.pyplot as plt
 
-from rn_core import autocorr, default_results_dir, make_weights, rng
+from rn_core import autocorr, default_results_dir, label_panels, make_weights, rng
 from rn_phase_2pi import (
     solve_uniform_phase_fixed_q_gaussian,
     solve_uniform_phase_gaussian_2pi,
 )
+
+
+def _normalized_off_event(covariance):
+    """Normalize a distinct-event kernel while omitting its contact bin."""
+    values = np.asarray(covariance, dtype=float).copy()
+    tail = values[1:]
+    finite = tail[np.isfinite(tail)]
+    scale = max(float(np.max(np.abs(finite))) if finite.size else 0.0, 1e-12)
+    values /= scale
+    if values.size:
+        values[0] = np.nan
+    return values
+
+
+def _off_event_curve(covariance):
+    """Return the distinct-event kernel with the contact bin hidden."""
+    values = np.asarray(covariance, dtype=float).copy()
+    if values.size:
+        values[0] = np.nan
+    return values
 
 # -----------------------------------------------------------------------------
 # TRANSFORMED THETA NEURON
@@ -180,6 +200,7 @@ def sim_phase_network(
     tau_max=50.0,
     n_probe=None,
     return_spike=False,
+    return_event=False,
     return_u=False,
     return_phase_density=False,
     phase_bin_width=0.25,
@@ -241,6 +262,9 @@ def sim_phase_network(
     probe_idx = np.arange(n_probe)
     U_probe = np.zeros((nt, n_probe))
     R_pop = np.zeros(nt, dtype=float) if return_spike else None
+    Event_probe = (
+        np.zeros((nt, n_probe), dtype=np.float32) if return_event else None
+    )
     Eta_probe = (
         np.zeros((nt, n_probe), dtype=np.float32)
         if return_phase_density
@@ -275,6 +299,8 @@ def sim_phase_network(
         U_probe[t] = u[probe_idx]
         if return_spike:
             R_pop[t] = np.mean(spike_counts) / dt
+        if return_event:
+            Event_probe[t] = spike_counts[probe_idx] / dt
         if return_phase_density:
             Eta_probe[t] = (
                 phi[probe_idx] >= threshold - phase_bin_width
@@ -285,13 +311,22 @@ def sim_phase_network(
     # exactly filtered same-event contribution of the point process.
     C = np.mean([autocorr(U_probe[:, i], max_lag) for i in range(n_probe)], axis=0)
     tau = np.arange(len(C)) * dt
-    if not return_spike and not return_u and not return_phase_density:
+    if not return_spike and not return_event and not return_u and not return_phase_density:
         return tau, C
 
     out = [tau, C]
     if return_spike:
         C_spk = autocorr(R_pop, max_lag)
         out.append(C_spk)
+    if return_event:
+        Q_event = np.mean(
+            [autocorr(Event_probe[:, i], max_lag) for i in range(n_probe)],
+            axis=0,
+        )
+        mean_rate = float(np.mean(Event_probe))
+        Q_event_off = Q_event.copy()
+        Q_event_off[0] -= mean_rate / dt
+        out.extend((Q_event, Q_event_off, mean_rate))
     if return_u:
         out.append(U_probe)
     if return_phase_density:
@@ -1194,6 +1229,8 @@ def theory_phase_density_autocorr(
         mean_rate=mean_rate,
         spike_covariance=spike_covariance,
         off_spike_covariance=off_covariance,
+        event_covariance=spike_covariance,
+        off_event_covariance=off_covariance,
         internal_dt=dt,
         drive_spectrum=drive_spectrum,
         static_variance=static_variance,
@@ -1402,6 +1439,7 @@ def _phase_twotime_paths(
     phases = np.empty((n_samples, n_time), dtype=np.float32)
     density = np.empty_like(phases)
     filtered_flux = np.zeros_like(drive)
+    event_rate = np.zeros_like(drive)
     velocity_derivative = np.zeros_like(drive)
     synapse = np.zeros(n_samples)
     decay = np.exp(-beta * dt)
@@ -1419,6 +1457,7 @@ def _phase_twotime_paths(
         phase, counts, displacement = _advance_phase(
             old_phase, drive[:, k], I, alpha, dt, model=phase_model
         )
+        event_rate[:, k] = counts / dt
         weighted_counts = _filtered_event_counts(
             old_phase,
             displacement,
@@ -1436,7 +1475,7 @@ def _phase_twotime_paths(
             phase >= threshold - phase_bin_width
         ) / phase_bin_width
 
-    return phases, density, filtered_flux, velocity_derivative
+    return phases, density, filtered_flux, event_rate, velocity_derivative
 
 
 def _theta_twotime_tangent_flux(
@@ -1634,7 +1673,7 @@ def theory_phase_twotime_dmft(
     normals /= np.maximum(np.std(normals, axis=0, keepdims=True), 1e-12)
 
     zero_drive = np.zeros((n_samples, n_time))
-    _, _, initial_flux, _ = _phase_twotime_paths(
+    _, _, initial_flux, _, _ = _phase_twotime_paths(
         zero_drive,
         initial_phase,
         I,
@@ -1651,7 +1690,7 @@ def theory_phase_twotime_dmft(
     converged = sigma == 0.0
     for iteration in range(int(max_iter)):
         drive = _sample_gaussian_kernel(covariance, normals)
-        phases, density, filtered_flux, velocity_derivative = _phase_twotime_paths(
+        phases, density, filtered_flux, _event_rate, velocity_derivative = _phase_twotime_paths(
             drive,
             initial_phase,
             I,
@@ -1677,7 +1716,7 @@ def theory_phase_twotime_dmft(
             break
 
     drive = _sample_gaussian_kernel(covariance, normals)
-    phases, density, filtered_flux, velocity_derivative = _phase_twotime_paths(
+    phases, density, filtered_flux, event_rate, velocity_derivative = _phase_twotime_paths(
         drive,
         initial_phase,
         I,
@@ -1689,10 +1728,12 @@ def theory_phase_twotime_dmft(
     )
     drive_centered = drive - np.mean(drive, axis=0, keepdims=True)
     density_centered = density - np.mean(density, axis=0, keepdims=True)
+    event_centered = event_rate - np.mean(event_rate, axis=0, keepdims=True)
     C11 = drive_centered.T @ drive_centered / n_samples
     C13 = drive_centered.T @ density_centered / n_samples
     C31 = C13.T
     C33 = density_centered.T @ density_centered / n_samples
+    Q_event = event_centered.T @ event_centered / n_samples
 
     response = {}
     causal_mask = np.tril(np.ones((n_time, n_time), dtype=bool), k=-1)
@@ -1714,6 +1755,10 @@ def theory_phase_twotime_dmft(
     C13_lag = _lag_average(C13, max_lag, row_later=True, start=start)
     C31_lag = _lag_average(C31, max_lag, row_later=True, start=start)
     C33_lag = _lag_average(C33, max_lag, row_later=True, start=start)
+    Q_event_lag = _lag_average(Q_event, max_lag, row_later=True, start=start)
+    mean_rate = float(np.mean(event_rate[:, start:]))
+    Q_event_off_lag = Q_event_lag.copy()
+    Q_event_off_lag[0] -= mean_rate / dt
     n_lag = max(1, int(tau_max / dtau))
     tau = np.arange(n_lag) * dtau
     result = np.interp(tau, internal_tau, C11_lag)
@@ -1733,6 +1778,9 @@ def theory_phase_twotime_dmft(
         C13_lag=C13_lag,
         C31_lag=C31_lag,
         phase_density_covariance=C33_lag,
+        event_covariance=Q_event_lag,
+        off_event_covariance=Q_event_off_lag,
+        mean_rate=mean_rate,
         phase_response_modes=response,
         phases=phases,
         filtered_flux=filtered_flux,
@@ -1804,6 +1852,11 @@ def theory_phase_fixed_q_gaussian(
     flux_C33_lag = _lag_average(
         solution.C33_threshold, max_lag, row_later=True, start=start
     )
+    event_covariance = _lag_average(
+        solution.flux_kernel, max_lag, row_later=True, start=start
+    )
+    off_event_covariance = event_covariance.copy()
+    off_event_covariance[0] -= float(np.mean(solution.mean_rate)) / internal_dt
     displacement = np.mod(F0 * internal_tau, 2.0 * np.pi)
     width = float(phase_bin_width)
     if not 0.0 < width <= 2.0 * np.pi:
@@ -1826,6 +1879,8 @@ def theory_phase_fixed_q_gaussian(
         phase_density_covariance=C33_lag,
         flux_density_covariance=flux_C33_lag,
         flux_kernel=solution.flux_kernel,
+        event_covariance=event_covariance,
+        off_event_covariance=off_event_covariance,
         mean_rate=solution.mean_rate,
         internal_dt=solution.dt,
         phase_dv=solution.dv,
@@ -1924,6 +1979,11 @@ def theory_phase_gaussian_2pi(
     flux_C33_lag = _lag_average(
         solution.C33_threshold, max_lag, row_later=True, start=start
     )
+    event_covariance = _lag_average(
+        solution.flux_kernel, max_lag, row_later=True, start=start
+    )
+    off_event_covariance = event_covariance.copy()
+    off_event_covariance[0] -= float(np.mean(solution.mean_rate)) / internal_dt
     displacement = np.mod(F0 * internal_tau, 2.0 * np.pi)
     width = float(phase_bin_width)
     if not 0.0 < width <= 2.0 * np.pi:
@@ -1957,6 +2017,8 @@ def theory_phase_gaussian_2pi(
         phase_density_covariance=C33_lag,
         flux_density_covariance=flux_C33_lag,
         flux_kernel=solution.flux_kernel,
+        event_covariance=event_covariance,
+        off_event_covariance=off_event_covariance,
         mean_rate=solution.mean_rate,
         internal_dt=solution.dt,
         phase_dv=solution.dv,
@@ -1988,6 +2050,26 @@ def theory_phase_autocorr(*args, solver="density", **kwargs):
         "phase theory solver must be 'gaussian_2pi', 'fixed_q', 'twotime', "
         "'density', or 'cusp'"
     )
+
+
+def _phase_theory_covariance_and_q(*, theory_kwargs, **model_kwargs):
+    """Evaluate a phase closure and expose its distinct-event kernel."""
+    kwargs = dict(theory_kwargs)
+    solver = str(kwargs.get("solver", "density")).lower()
+    if solver in ("cusp", "scalar", "smooth"):
+        tau, covariance, sigma_c = theory_phase_autocorr(
+            **model_kwargs, **kwargs
+        )
+        return tau, covariance, sigma_c, None, None, None
+    kwargs["return_diagnostics"] = True
+    tau, covariance, sigma_c, diagnostics = theory_phase_autocorr(
+        **model_kwargs, **kwargs
+    )
+    q_off = diagnostics.get("off_event_covariance")
+    if q_off is None:
+        return tau, covariance, sigma_c, None, None, diagnostics
+    tau_q = np.arange(len(q_off)) * diagnostics["internal_dt"]
+    return tau, covariance, sigma_c, tau_q, q_off, diagnostics
 
 
 def plot_phase_operational_criticality(
@@ -2068,6 +2150,7 @@ def plot_phase_operational_criticality(
     axes[1].legend()
     axes[1].grid(alpha=0.25)
 
+    label_panels(axes)
     plt.tight_layout()
     outpath = os.path.join(plot_dir, "phase_operational_criticality.png")
     plt.savefig(outpath, dpi=150)
@@ -2121,26 +2204,39 @@ def plot_phase_theory_comparison(
         ]
 
     C_runs = []
+    Qoff_runs = []
     tau_s = None
     local_rng = np.random.default_rng(seed)
     if n_probe is None:
         n_probe = N
     slow_factor = _beta_time_factor(beta) if scale_slow_beta_time else 1.0
     for _ in range(max(1, int(sim_reps))):
-        tau_run, C_run = sim_phase_network(
+        tau_run, C_run, _Q_run, Qoff_run, _mean_rate = sim_phase_network(
             N=N, I=I, alpha=alpha, sigma=sigma, beta=beta,
             T=T * slow_factor, dt=dt, burn=burn * slow_factor,
-            tau_max=tau_max, n_probe=min(int(n_probe), N), rng=local_rng,
+            tau_max=tau_max, n_probe=min(int(n_probe), N),
+            return_event=True, rng=local_rng,
         )
         tau_s = tau_run
         C_runs.append(C_run)
+        Qoff_runs.append(Qoff_run)
     C_s = np.mean(C_runs, axis=0)
     C_s_norm = C_s / C_s[0] if C_s[0] > 0 else C_s
+    Qoff_s = np.mean(Qoff_runs, axis=0)
 
-    fig, ax = plt.subplots(figsize=(8, 4.8))
-    ax.plot(
+    fig, axes = plt.subplots(1, 2, figsize=(12.0, 4.8))
+    ax_c, ax_q = axes
+    ax_c.plot(
         tau_s,
         C_s_norm,
+        color="k",
+        lw=2.0,
+        zorder=5,
+        label=f"simulation ({sim_reps} runs)",
+    )
+    ax_q.plot(
+        tau_s,
+        _off_event_curve(Qoff_s),
         color="k",
         lw=2.0,
         zorder=5,
@@ -2152,24 +2248,40 @@ def plot_phase_theory_comparison(
         style = dict(variant.get("style", {}))
         label = variant.get("label", kwargs.get("solver", "theory"))
         try:
-            tau_th, C_th, _ = theory_phase_autocorr(
+            tau_th, C_th, _, tau_q, q_off, _ = _phase_theory_covariance_and_q(
+                theory_kwargs=kwargs,
                 I=I, alpha=alpha, sigma=sigma, beta=beta,
-                tau_max=tau_max, dtau=dtau, **kwargs,
+                tau_max=tau_max, dtau=dtau,
             )
             norm = max(abs(C_th[0]), 1e-12)
-            ax.plot(tau_th, C_th / norm, label=label, **style)
+            ax_c.plot(tau_th, C_th / norm, label=label, **style)
+            if q_off is not None:
+                ax_q.plot(
+                    tau_q,
+                    _off_event_curve(q_off),
+                    label=label,
+                    **style,
+                )
         except Exception as err:
             print(f"  theory variant failed ({label}): {err}")
 
-    ax.axhline(0, color="k", lw=0.5)
-    ax.set(
-        xlabel=r"$\tau$",
+    for axis in axes:
+        axis.axhline(0, color="k", lw=0.5)
+        axis.set(xlabel=r"$\tau$", xlim=(0, tau_max))
+        axis.legend(fontsize=8)
+    ax_c.set(
         ylabel=r"$C_{uu}(\tau) / C_{uu}(0)$",
-        title=fr"Phase theory comparison: $\sigma={sigma:.2f}$, $g={sigma/sigma_c:.2f}$",
-        xlim=(0, tau_max),
+        title="Recurrent-field covariance",
         ylim=(-0.35, 1.1),
     )
-    ax.legend(fontsize=8)
+    ax_q.set(
+        ylabel=r"$Q_{\nu,\mathrm{off}}(\tau)$",
+        title="Distinct-event output kernel",
+    )
+    fig.suptitle(
+        fr"Phase theory comparison: $\sigma={sigma:.2f}$, $g={sigma/sigma_c:.2f}$"
+    )
+    label_panels(axes)
     plt.tight_layout()
     outpath = os.path.join(plot_dir, "phase_theory_comparison.png")
     plt.savefig(outpath, dpi=150)
@@ -2225,15 +2337,16 @@ def plot_phase_theory_examples(
         ]
 
     n = len(examples)
-    ncols = 2 if n == 4 else min(3, n)
-    nrows = (n + ncols - 1) // ncols
-    fig, axes = plt.subplots(nrows, ncols, figsize=(5.2 * ncols, 4.0 * nrows))
-    axes_flat = np.array(axes).reshape(-1)
+    fig, axes = plt.subplots(2, n, figsize=(4.5 * n, 7.5), sharex="col")
+    if n == 1:
+        axes = np.asarray(axes).reshape(2, 1)
     local_rng = np.random.default_rng(seed)
     if n_probe is None:
         n_probe = N
 
-    for ax, ex in zip(axes_flat, examples):
+    for column, ex in enumerate(examples):
+        ax_c = axes[0, column]
+        ax_q = axes[1, column]
         I = ex.get("I", 1.0)
         alpha = ex.get("alpha", 1.0)
         beta = ex.get("beta", 1.0)
@@ -2243,21 +2356,33 @@ def plot_phase_theory_examples(
         print(f"  example {label}: sigma={sigma:.3f}, sigma/sigma_c={sigma/sigma_c:.2f}")
 
         C_runs = []
+        Qoff_runs = []
         tau_s = None
         slow_factor = _beta_time_factor(beta) if scale_slow_beta_time else 1.0
         for _ in range(max(1, int(sim_reps))):
-            tau_run, C_run = sim_phase_network(
+            tau_run, C_run, _Q_run, Qoff_run, _mean_rate = sim_phase_network(
                 N=N, I=I, alpha=alpha, sigma=sigma, beta=beta,
                 T=T * slow_factor, dt=dt, burn=burn * slow_factor,
-                tau_max=tau_max, n_probe=min(int(n_probe), N), rng=local_rng,
+                tau_max=tau_max, n_probe=min(int(n_probe), N),
+                return_event=True, rng=local_rng,
             )
             tau_s = tau_run
             C_runs.append(C_run)
+            Qoff_runs.append(Qoff_run)
         C_s = np.mean(C_runs, axis=0)
         C_s_norm = C_s / C_s[0] if C_s[0] > 0 else C_s
-        ax.plot(
+        Qoff_s = np.mean(Qoff_runs, axis=0)
+        ax_c.plot(
             tau_s,
             C_s_norm,
+            color="k",
+            lw=1.8,
+            zorder=5,
+            label="simulation",
+        )
+        ax_q.plot(
+            tau_s,
+            _off_event_curve(Qoff_s),
             color="k",
             lw=1.8,
             zorder=5,
@@ -2269,33 +2394,43 @@ def plot_phase_theory_examples(
             style = dict(variant.get("style", {}))
             vlabel = variant.get("label", kwargs.get("solver", "theory"))
             try:
-                tau_th, C_th, _ = theory_phase_autocorr(
+                tau_th, C_th, _, tau_q, q_off, _ = _phase_theory_covariance_and_q(
+                    theory_kwargs=kwargs,
                     I=I, alpha=alpha, sigma=sigma, beta=beta,
-                    tau_max=tau_max, dtau=dtau, **kwargs,
+                    tau_max=tau_max, dtau=dtau,
                 )
                 norm = max(abs(C_th[0]), 1e-12)
-                ax.plot(tau_th, C_th / norm, label=vlabel, **style)
+                ax_c.plot(tau_th, C_th / norm, label=vlabel, **style)
+                if q_off is not None:
+                    ax_q.plot(
+                        tau_q,
+                        _off_event_curve(q_off),
+                        label=vlabel,
+                        **style,
+                    )
             except Exception as err:
                 print(f"    theory variant failed ({vlabel}): {err}")
 
-        ax.axhline(0, color="k", lw=0.5)
-        ax.set(
-            xlabel=r"$\tau$",
+        for axis in (ax_c, ax_q):
+            axis.axhline(0, color="k", lw=0.5)
+            axis.set(xlim=(0, tau_max))
+            axis.legend(fontsize=7)
+        ax_c.set(
             ylabel=r"$C_{uu}(\tau)/C_{uu}(0)$",
             title=label,
-            xlim=(0, tau_max),
             ylim=(-0.35, 1.1),
         )
-        ax.legend(fontsize=7)
-
-    for ax in axes_flat[n:]:
-        ax.set_visible(False)
+        ax_q.set(
+            xlabel=r"$\tau$",
+            ylabel=r"$Q_{\nu,\mathrm{off}}(\tau)$",
+        )
 
     plt.suptitle(
         "Phase network: two-time and stationary event-DMFT",
         fontsize=13,
         fontweight="bold",
     )
+    label_panels(axes)
     plt.tight_layout()
     outpath = os.path.join(plot_dir, "phase_theory_examples.png")
     plt.savefig(outpath, dpi=150)
@@ -2349,8 +2484,9 @@ def plot_phase_beta_scaling_diagnostic(
     sigma = g_val * sigma_c
 
     beta_vals = tuple(float(b) for b in beta_vals)
-    fig, axes = plt.subplots(1, 2, figsize=(12.5, 4.6), sharey=True)
-    ax_raw, ax_scaled = axes
+    fig, axes = plt.subplots(2, 2, figsize=(12.5, 8.2))
+    ax_raw, ax_scaled = axes[0]
+    ax_q_raw, ax_q_scaled = axes[1]
     colors = plt.cm.viridis(np.linspace(0.12, 0.88, len(beta_vals)))
     max_raw_tau = tau_max / max(min(beta_vals), 1e-12)
     local_rng = np.random.default_rng(seed)
@@ -2360,27 +2496,33 @@ def plot_phase_beta_scaling_diagnostic(
     for beta, color in zip(beta_vals, colors):
         print(f"  beta scaling: beta={beta:g}, sigma={sigma:.3f}, g={g_val:.2f}")
         C_runs = []
+        Qoff_runs = []
         tau_s = None
         slow_factor = _beta_time_factor(beta) if scale_slow_beta_time else 1.0
         raw_tau_max = tau_max / max(float(beta), 1e-12)
         T_run = max(T * slow_factor, float(min_T))
         burn_run = max(burn * slow_factor, float(min_burn))
         for _ in range(max(1, int(sim_reps))):
-            tau_run, C_run = sim_phase_network(
+            tau_run, C_run, _Q_run, Qoff_run, _mean_rate = sim_phase_network(
                 N=N, I=I, alpha=alpha, sigma=sigma, beta=beta,
                 T=T_run, dt=dt, burn=burn_run,
                 tau_max=raw_tau_max,
                 n_probe=min(int(n_probe), int(N)),
+                return_event=True,
                 rng=local_rng,
             )
             tau_s = tau_run
             C_runs.append(C_run)
+            Qoff_runs.append(Qoff_run)
         C_s = np.mean(C_runs, axis=0)
         C_s_norm = C_s / max(abs(C_s[0]), 1e-12)
+        Qoff_s_curve = _off_event_curve(np.mean(Qoff_runs, axis=0))
         ax_raw.plot(tau_s, C_s_norm, color=color, lw=1.8,
                     label=fr"sim $\beta={beta:g}$")
         ax_scaled.plot(beta * tau_s, C_s_norm, color=color, lw=1.8,
                        label=fr"sim $\beta={beta:g}$")
+        ax_q_raw.plot(tau_s, Qoff_s_curve, color=color, lw=1.8)
+        ax_q_scaled.plot(beta * tau_s, Qoff_s_curve, color=color, lw=1.8)
 
         for variant in theory_variants:
             kwargs = dict(variant.get("kwargs", {}))
@@ -2389,9 +2531,10 @@ def plot_phase_beta_scaling_diagnostic(
             linestyle = "--" if solver == "twotime_dmft" else ":"
             linewidth = 2.3 if solver == "twotime_dmft" else 1.8
             try:
-                tau_th, C_th, _ = theory_phase_autocorr(
+                tau_th, C_th, _, tau_q, q_off, _ = _phase_theory_covariance_and_q(
+                    theory_kwargs=kwargs,
                     I=I, alpha=alpha, sigma=sigma, beta=beta,
-                    tau_max=raw_tau_max, dtau=dtau, **kwargs,
+                    tau_max=raw_tau_max, dtau=dtau,
                 )
                 C_th_norm = C_th / max(abs(C_th[0]), 1e-12)
                 ax_raw.plot(
@@ -2410,6 +2553,16 @@ def plot_phase_beta_scaling_diagnostic(
                     lw=linewidth,
                     alpha=0.95,
                 )
+                if q_off is not None:
+                    q_curve = _off_event_curve(q_off)
+                    ax_q_raw.plot(
+                        tau_q, q_curve, color=color, ls=linestyle,
+                        lw=linewidth, alpha=0.95,
+                    )
+                    ax_q_scaled.plot(
+                        beta * tau_q, q_curve, color=color, ls=linestyle,
+                        lw=linewidth, alpha=0.95,
+                    )
             except Exception as err:
                 print(f"    theory failed ({label}, beta={beta:g}): {err}")
 
@@ -2435,10 +2588,11 @@ def plot_phase_beta_scaling_diagnostic(
         Line2D([0], [0], color=color, lw=2.5, label=fr"$\beta={beta:g}$")
         for beta, color in zip(beta_vals, colors)
     ]
-    for ax in axes:
+    for ax in axes.flat:
         ax.axhline(0, color="k", lw=0.5)
-        ax.set(ylim=(-0.35, 1.1))
         ax.legend(handles=method_handles + beta_handles, fontsize=8, ncol=2)
+    for ax in axes[0]:
+        ax.set(ylim=(-0.35, 1.1))
 
     ax_raw.set(
         xlabel=r"$\tau$",
@@ -2451,11 +2605,23 @@ def plot_phase_beta_scaling_diagnostic(
         title="Scaled time",
         xlim=(0, tau_max),
     )
+    ax_q_raw.set(
+        xlabel=r"$\tau$",
+        ylabel=r"$Q_{\nu,\mathrm{off}}(\tau)$",
+        title="Output kernel, raw time",
+        xlim=(0, max_raw_tau),
+    )
+    ax_q_scaled.set(
+        xlabel=r"$\beta\tau$",
+        title="Output kernel, scaled time",
+        xlim=(0, tau_max),
+    )
 
     plt.suptitle(
         fr"Phase beta diagnostic: raw vs scaled time, $\alpha={alpha}$, $g={g_val}$",
         fontsize=13, fontweight="bold",
     )
+    label_panels(axes)
     plt.tight_layout()
     outpath = os.path.join(plot_dir, "phase_beta_scaling_diagnostic.png")
     plt.savefig(outpath, dpi=150)
@@ -2501,14 +2667,10 @@ def plot_phase_network_N_convergence(
     theories = []
     for variant in theory_variants:
         kwargs = dict(variant.get("kwargs", {}))
-        tau_th, C_th, _ = theory_phase_autocorr(
-            I=I,
-            alpha=alpha,
-            sigma=sigma,
-            beta=beta,
-            tau_max=tau_max,
-            dtau=dtau,
-            **kwargs,
+        tau_th, C_th, _, tau_q, q_off, _ = _phase_theory_covariance_and_q(
+            theory_kwargs=kwargs,
+            I=I, alpha=alpha, sigma=sigma, beta=beta,
+            tau_max=tau_max, dtau=dtau,
         )
         theories.append(
             dict(
@@ -2517,6 +2679,11 @@ def plot_phase_network_N_convergence(
                 tau=tau_th,
                 covariance=C_th,
                 normalized=C_th / max(abs(C_th[0]), 1e-12),
+                tau_q=tau_q,
+                q_off=q_off,
+                q_normalized=(
+                    _off_event_curve(q_off) if q_off is not None else None
+                ),
             )
         )
 
@@ -2526,16 +2693,21 @@ def plot_phase_network_N_convergence(
     colors = plt.cm.viridis(np.linspace(0.12, 0.88, len(N_vals)))
     local_rng = np.random.default_rng(seed)
     curves = []
+    q_curves = []
     variance_mean = []
     variance_sem = []
+    q_scale_mean = []
+    q_scale_sem = []
 
     for N in N_vals:
         print(f"  phase N convergence: N={N}, reps={sim_reps}")
         run_curves = []
+        run_q_curves = []
         run_variance = []
+        run_q_scale = []
         tau_sim = None
         for _ in range(max(1, int(sim_reps))):
-            tau_sim, covariance = sim_phase_network(
+            tau_sim, covariance, _q_event, q_off, _mean_rate = sim_phase_network(
                 N=int(N),
                 I=I,
                 alpha=alpha,
@@ -2546,25 +2718,39 @@ def plot_phase_network_N_convergence(
                 burn=burn,
                 tau_max=tau_max,
                 n_probe=int(N),
+                return_event=True,
                 rng=local_rng,
             )
             normalized = covariance / max(abs(covariance[0]), 1e-12)
             run_curves.append(normalized)
+            run_q_curves.append(_off_event_curve(q_off))
             run_variance.append(float(covariance[0]))
+            run_q_scale.append(float(np.max(np.abs(q_off[1:]))))
 
         run_curves = np.asarray(run_curves)
         run_variance = np.asarray(run_variance)
+        run_q_scale = np.asarray(run_q_scale)
         curves.append(np.mean(run_curves, axis=0))
+        q_mean = np.mean(np.asarray(run_q_curves)[:, 1:], axis=0)
+        q_curves.append(np.concatenate(([np.nan], q_mean)))
         variance_mean.append(float(np.mean(run_variance)))
+        q_scale_mean.append(float(np.mean(run_q_scale)))
         if len(run_variance) > 1:
             variance_sem.append(
                 float(np.std(run_variance, ddof=1) / np.sqrt(len(run_variance)))
             )
         else:
             variance_sem.append(0.0)
+        if len(run_q_scale) > 1:
+            q_scale_sem.append(
+                float(np.std(run_q_scale, ddof=1) / np.sqrt(len(run_q_scale)))
+            )
+        else:
+            q_scale_sem.append(0.0)
 
-    fig, axes = plt.subplots(1, 2, figsize=(12.0, 4.5))
-    ax_cov, ax_error = axes
+    fig, axes = plt.subplots(2, 2, figsize=(12.0, 8.2))
+    ax_cov, ax_q = axes[0]
+    ax_error, ax_q_error = axes[1]
     for theory in theories:
         ax_cov.plot(
             theory["tau"],
@@ -2572,8 +2758,14 @@ def plot_phase_network_N_convergence(
             label=theory["label"],
             **theory["style"],
         )
-    for N, color, covariance in zip(N_vals, colors, curves):
+        if theory["q_off"] is not None:
+            ax_q.plot(
+                theory["tau_q"], theory["q_normalized"],
+                label=theory["label"], **theory["style"],
+            )
+    for N, color, covariance, q_curve in zip(N_vals, colors, curves, q_curves):
         ax_cov.plot(tau_sim, covariance, color=color, lw=1.6, label=fr"$N={N}$")
+        ax_q.plot(tau_sim, q_curve, color=color, lw=1.6, label=fr"$N={N}$")
     ax_cov.axhline(0.0, color="k", lw=0.5)
     ax_cov.set(
         xlabel=r"$\tau$",
@@ -2583,6 +2775,14 @@ def plot_phase_network_N_convergence(
         ylim=(-0.3, 1.05),
     )
     ax_cov.legend(fontsize=8)
+    ax_q.axhline(0.0, color="k", lw=0.5)
+    ax_q.set(
+        xlabel=r"$\tau$",
+        ylabel=r"$Q_{\nu,\mathrm{off}}(\tau)$",
+        title="Distinct-event output kernel",
+        xlim=(0.0, tau_max),
+    )
+    ax_q.legend(fontsize=8)
 
     variance_mean = np.asarray(variance_mean)
     variance_sem = np.asarray(variance_sem)
@@ -2612,12 +2812,35 @@ def plot_phase_network_N_convergence(
     ax_error.grid(alpha=0.25)
     ax_error.legend(fontsize=8)
 
+    q_scale_mean = np.asarray(q_scale_mean)
+    q_scale_sem = np.asarray(q_scale_sem)
+    ax_q_error.errorbar(
+        N_vals, q_scale_mean, yerr=q_scale_sem, fmt="o-", color="C3",
+        lw=1.8, capsize=3, label="simulation",
+    )
+    for theory in theories:
+        if theory["q_off"] is not None:
+            ax_q_error.axhline(
+                np.max(np.abs(theory["q_off"][1:])),
+                label=theory["label"], **theory["style"],
+            )
+    ax_q_error.set_xscale("log", base=2)
+    ax_q_error.set_xticks(N_vals, labels=[str(N) for N in N_vals])
+    ax_q_error.set(
+        xlabel=r"network size $N$",
+        ylabel=r"$\max_{\tau>0}|Q_{\nu,\mathrm{off}}(\tau)|$",
+        title="Finite-size output-kernel amplitude",
+    )
+    ax_q_error.grid(alpha=0.25)
+    ax_q_error.legend(fontsize=8)
+
     plt.suptitle(
         fr"Deterministic phase network: finite-size convergence "
         fr"($\alpha={alpha:g}$, $\beta={beta:g}$, $g={g_val:g}$)",
         fontsize=13,
         fontweight="bold",
     )
+    label_panels(axes)
     plt.tight_layout()
     outpath = os.path.join(plot_dir, "phase_network_N_convergence.png")
     plt.savefig(outpath, dpi=150)
@@ -2766,6 +2989,7 @@ def plot_phase_density_correlation(
         fontsize=13,
         fontweight="bold",
     )
+    label_panels(axes)
     plt.tight_layout()
     outpath = os.path.join(plot_dir, "phase_density_correlation.png")
     plt.savefig(outpath, dpi=150)
@@ -2946,6 +3170,7 @@ def plot_phase_fixed_q_diagnostic(
         fontsize=13,
         fontweight="bold",
     )
+    label_panels(axes)
     plt.tight_layout()
     outpath = os.path.join(plot_dir, "phase_fixed_q_diagnostic.png")
     plt.savefig(outpath, dpi=180)
@@ -2996,7 +3221,10 @@ def plot_phase_gaussian_2pi_comparison(
             sim_reps=sim_reps,
             phase_bin_width=phase_bin_width,
         )
-        cache_matches = np.array_equal(candidate["g_vals"], g_vals)
+        cache_matches = (
+            "Qoff" in candidate
+            and np.array_equal(candidate["g_vals"], g_vals)
+        )
         for name, expected in expected_cache_parameters.items():
             cache_matches = cache_matches and name in candidate
             if cache_matches:
@@ -3007,13 +3235,22 @@ def plot_phase_gaussian_2pi_comparison(
             cached = candidate
     if cached is None:
         simulation_C11 = []
+        simulation_Qoff = []
         simulation_C33 = []
         tau_sim = None
         for g_val in g_vals:
             C11_runs = []
+            Qoff_runs = []
             C33_runs = []
             for _rep in range(int(sim_reps)):
-                tau_run, C11_run, C33_run = sim_phase_network(
+                (
+                    tau_run,
+                    C11_run,
+                    _Q_run,
+                    Qoff_run,
+                    _mean_rate,
+                    C33_run,
+                ) = sim_phase_network(
                     N=N,
                     I=I,
                     alpha=alpha,
@@ -3024,16 +3261,20 @@ def plot_phase_gaussian_2pi_comparison(
                     burn=burn,
                     tau_max=tau_max,
                     n_probe=min(n_probe, N),
+                    return_event=True,
                     return_phase_density=True,
                     phase_bin_width=phase_bin_width,
                     rng=local_rng,
                 )
                 tau_sim = tau_run
                 C11_runs.append(C11_run)
+                Qoff_runs.append(Qoff_run)
                 C33_runs.append(C33_run)
             simulation_C11.append(np.mean(C11_runs, axis=0))
+            simulation_Qoff.append(np.mean(Qoff_runs, axis=0))
             simulation_C33.append(np.mean(C33_runs, axis=0))
         simulation_C11 = np.asarray(simulation_C11)
+        simulation_Qoff = np.asarray(simulation_Qoff)
         simulation_C33 = np.asarray(simulation_C33)
         if sim_cache_path is not None:
             np.savez_compressed(
@@ -3041,6 +3282,7 @@ def plot_phase_gaussian_2pi_comparison(
                 g_vals=g_vals,
                 tau=tau_sim,
                 C11=simulation_C11,
+                Qoff=simulation_Qoff,
                 C33=simulation_C33,
                 N=N,
                 T=T,
@@ -3052,6 +3294,7 @@ def plot_phase_gaussian_2pi_comparison(
     else:
         tau_sim = cached["tau"]
         simulation_C11 = cached["C11"]
+        simulation_Qoff = cached["Qoff"]
         simulation_C33 = cached["C33"]
 
     stationary_options = dict(
@@ -3077,7 +3320,7 @@ def plot_phase_gaussian_2pi_comparison(
         twotime_options.update(twotime_kwargs)
 
     fig, axes = plt.subplots(
-        2, len(g_vals), figsize=(5.0 * len(g_vals), 8.2), sharex="col"
+        3, len(g_vals), figsize=(5.0 * len(g_vals), 11.3), sharex="col"
     )
     if len(g_vals) == 1:
         axes = np.asarray(axes)[:, None]
@@ -3090,6 +3333,13 @@ def plot_phase_gaussian_2pi_comparison(
     def normalized_rmse(reference, prediction):
         difference = normalized(reference) - normalized(prediction)
         return float(np.sqrt(np.mean(difference**2)))
+
+    def off_event_rmse(reference, prediction):
+        difference = _normalized_off_event(reference)[1:] - _normalized_off_event(
+            prediction
+        )[1:]
+        finite = np.isfinite(difference)
+        return float(np.sqrt(np.mean(difference[finite] ** 2)))
 
     for column, g_val in enumerate(g_vals):
         sigma = float(g_val) * sigma_c
@@ -3135,7 +3385,22 @@ def plot_phase_gaussian_2pi_comparison(
             )
         )
         C11_sim = simulation_C11[column]
+        Qoff_sim = simulation_Qoff[column]
         C33_sim = simulation_C33[column]
+        Qoff_stationary = diagnostic_stationary["off_event_covariance"]
+        tau_Q_stationary = (
+            np.arange(len(Qoff_stationary))
+            * diagnostic_stationary["internal_dt"]
+        )
+        Qoff_2pi = diagnostic_2pi["off_event_covariance"]
+        tau_Q_2pi = (
+            np.arange(len(Qoff_2pi)) * diagnostic_2pi["internal_dt"]
+        )
+        Qoff_twotime = diagnostic_twotime["off_event_covariance"]
+        tau_Q_twotime = (
+            np.arange(len(Qoff_twotime))
+            * diagnostic_twotime["internal_dt"]
+        )
         C33_stationary = diagnostic_stationary["phase_density_covariance"]
         tau_C33_stationary = (
             np.arange(len(C33_stationary))
@@ -3152,12 +3417,17 @@ def plot_phase_gaussian_2pi_comparison(
         )
 
         ax_C11 = axes[0, column]
-        ax_C33 = axes[1, column]
+        ax_Q = axes[1, column]
+        ax_C33 = axes[2, column]
         marker_step = max(1, len(tau_sim) // 36)
-        for axis, values in ((ax_C11, C11_sim), (ax_C33, C33_sim)):
+        for axis, values, transform in (
+            (ax_C11, C11_sim, normalized),
+            (ax_Q, Qoff_sim, _off_event_curve),
+            (ax_C33, C33_sim, normalized),
+        ):
             axis.plot(
                 tau_sim,
-                normalized(values),
+                transform(values),
                 color="k",
                 lw=1.0,
                 alpha=0.65,
@@ -3165,7 +3435,7 @@ def plot_phase_gaussian_2pi_comparison(
             )
             axis.plot(
                 tau_sim,
-                normalized(values),
+                transform(values),
                 color="k",
                 ls="none",
                 marker="o",
@@ -3186,6 +3456,14 @@ def plot_phase_gaussian_2pi_comparison(
             ax_C33.plot(
                 tau_C33_2pi,
                 normalized(C33_2pi),
+                color="0.65",
+                ls=":",
+                lw=1.5,
+                label="Hartree/Wick",
+            )
+            ax_Q.plot(
+                tau_Q_2pi,
+                _off_event_curve(Qoff_2pi),
                 color="0.65",
                 ls=":",
                 lw=1.5,
@@ -3217,6 +3495,14 @@ def plot_phase_gaussian_2pi_comparison(
             lw=1.8,
             label="stationary event-DMFT",
         )
+        ax_Q.plot(
+            tau_Q_stationary,
+            _off_event_curve(Qoff_stationary),
+            color="C3",
+            ls="--",
+            lw=1.8,
+            label="stationary event-DMFT",
+        )
         ax_C11.plot(
             tau_twotime,
             normalized(C11_twotime),
@@ -3235,9 +3521,23 @@ def plot_phase_gaussian_2pi_comparison(
             label="two-time event-DMFT",
             zorder=3,
         )
+        ax_Q.plot(
+            tau_Q_twotime,
+            _off_event_curve(Qoff_twotime),
+            color="C0",
+            ls="-",
+            lw=2.1,
+            label="two-time event-DMFT",
+            zorder=3,
+        )
         ax_C11.axhline(0.0, color="0.3", lw=0.5)
+        ax_Q.axhline(0.0, color="0.3", lw=0.5)
         ax_C33.axhline(0.0, color="0.3", lw=0.5)
         ax_C11.set(title=fr"$g={g_val:g}$", ylabel=r"$C_{11}(\tau)/C_{11}(0)$")
+        ax_Q.set(
+            ylabel=r"$Q_{\nu,\mathrm{off}}(\tau)$",
+            xlim=(0.0, tau_max),
+        )
         ax_C33.set(
             xlabel=r"$\tau$",
             ylabel=r"$C_{33}(v_T,v_T,\tau)/C_{33}(v_T,v_T,0)$",
@@ -3245,8 +3545,14 @@ def plot_phase_gaussian_2pi_comparison(
         )
 
         C11_stationary_on_sim = np.interp(tau_sim, tau_stationary, C11_stationary)
+        Qoff_stationary_on_sim = np.interp(
+            tau_sim, tau_Q_stationary, Qoff_stationary
+        )
         C33_stationary_on_sim = np.interp(tau_sim, tau_C33_stationary, C33_stationary)
         C11_twotime_on_sim = np.interp(tau_sim, tau_twotime, C11_twotime)
+        Qoff_twotime_on_sim = np.interp(
+            tau_sim, tau_Q_twotime, Qoff_twotime
+        )
         C33_twotime_on_sim = np.interp(
             tau_sim, tau_C33_twotime, C33_twotime
         )
@@ -3256,6 +3562,9 @@ def plot_phase_gaussian_2pi_comparison(
             gaussian_feedback_eigenvalue=float(diagnostic_2pi["feedback_eigenvalue"]),
             gaussian_critical_sigma=float(diagnostic_2pi["gaussian_critical_sigma"]),
             stationary_C11_rmse=normalized_rmse(C11_sim, C11_stationary_on_sim),
+            stationary_Qoff_rmse=off_event_rmse(
+                Qoff_sim, Qoff_stationary_on_sim
+            ),
             stationary_C33_rmse=normalized_rmse(C33_sim, C33_stationary_on_sim),
             stationary_C11_variance_error=float(
                 abs(C11_stationary[0] - C11_sim[0]) / max(abs(C11_sim[0]), 1e-12)
@@ -3265,20 +3574,24 @@ def plot_phase_gaussian_2pi_comparison(
                 diagnostic_twotime["residual_history"][-1]
             ),
             twotime_C11_rmse=normalized_rmse(C11_sim, C11_twotime_on_sim),
+            twotime_Qoff_rmse=off_event_rmse(Qoff_sim, Qoff_twotime_on_sim),
             twotime_C33_rmse=normalized_rmse(C33_sim, C33_twotime_on_sim),
             twotime_C11_variance_error=float(
                 abs(C11_twotime[0] - C11_sim[0])
                 / max(abs(C11_sim[0]), 1e-12)
             ),
             gaussian_C11_rmse=np.nan,
+            gaussian_Qoff_rmse=np.nan,
             gaussian_C33_rmse=np.nan,
             gaussian_C11_variance_error=np.nan,
         )
         if diagnostic_2pi["stable"]:
             C11_2pi_on_sim = np.interp(tau_sim, tau_2pi, C11_2pi)
+            Qoff_2pi_on_sim = np.interp(tau_sim, tau_Q_2pi, Qoff_2pi)
             C33_2pi_on_sim = np.interp(tau_sim, tau_C33_2pi, C33_2pi)
             row.update(
                 gaussian_C11_rmse=normalized_rmse(C11_sim, C11_2pi_on_sim),
+                gaussian_Qoff_rmse=off_event_rmse(Qoff_sim, Qoff_2pi_on_sim),
                 gaussian_C33_rmse=normalized_rmse(C33_sim, C33_2pi_on_sim),
                 gaussian_C11_variance_error=float(
                     abs(C11_2pi[0] - C11_sim[0]) / max(abs(C11_sim[0]), 1e-12)
@@ -3312,6 +3625,14 @@ def plot_phase_gaussian_2pi_comparison(
             f"{row['twotime_C33_rmse']:.3f}",
             **{**annotation_style, "transform": ax_C33.transAxes},
         )
+        ax_Q.text(
+            0.65,
+            0.95,
+            "RMSE: stationary / two-time\n"
+            f"{row['stationary_Qoff_rmse']:.3f} / "
+            f"{row['twotime_Qoff_rmse']:.3f}",
+            **{**annotation_style, "transform": ax_Q.transAxes},
+        )
         metric_rows.append(row)
         diagnostics_out.append(
             (diagnostic_2pi, diagnostic_stationary, diagnostic_twotime)
@@ -3319,10 +3640,12 @@ def plot_phase_gaussian_2pi_comparison(
 
     axes[0, 0].legend(fontsize=8)
     axes[1, 0].legend(fontsize=8)
+    axes[2, 0].legend(fontsize=8)
     plt.suptitle(
         "Deterministic phase network: hierarchy of 2PI/DMFT closures",
         fontsize=13,
     )
+    label_panels(axes)
     plt.tight_layout()
     outpath = os.path.join(plot_dir, "phase_gaussian_2pi_comparison.png")
     plt.savefig(outpath, dpi=180)
@@ -3620,6 +3943,7 @@ def plot_u_timeseries(
         fr"Phase network: $u(t)$ time series  ($I={I}$, $\alpha={alpha}$, $\sigma_c={sigma_c:.2f}$)",
         fontsize=12, fontweight="bold",
     )
+    label_panels(axes)
     plt.tight_layout()
     outpath = os.path.join(plot_dir, "phase_u_timeseries.png")
     plt.savefig(outpath, dpi=150)
@@ -3710,6 +4034,7 @@ def plot_phase_raster(
         fr"Phase network: spike raster  ($I={I}$, $\alpha={alpha}$, $\sigma_c={sigma_c:.2f}$)",
         fontsize=12, fontweight="bold",
     )
+    label_panels(axes)
     plt.tight_layout()
     outpath = os.path.join(plot_dir, "phase_raster.png")
     plt.savefig(outpath, dpi=150)

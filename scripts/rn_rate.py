@@ -7,7 +7,7 @@ from numpy.fft import fft, fftfreq
 import matplotlib.pyplot as plt
 from scipy.special import expit
 
-from rn_core import autocorr, default_results_dir, make_weights, rng
+from rn_core import autocorr, default_results_dir, label_panels, make_weights, rng
 
 
 def sigmoid_output(u, theta=0.0, delta=0.5):
@@ -27,8 +27,10 @@ def _stationary_spectrum(values, smoothing_bins=1):
         numerator = np.convolve(spectrum, kernel, mode="same")
         denominator = np.convolve(np.ones_like(spectrum), kernel, mode="same")
         spectrum = numerator / denominator
-    if spectrum.size > 1:
-        spectrum[0] = spectrum[1]
+    # Each path was centered separately, so its finite-window zero mode is
+    # identically zero. Restoring a random DC component here would make the
+    # sampling map inconsistent with the covariance estimator.
+    spectrum[0] = 0.0
     return spectrum
 
 
@@ -48,6 +50,54 @@ def _sample_stationary_gaussian(spectrum, normals, n_time):
     spectrum = np.maximum(np.asarray(spectrum, dtype=float), 0.0)
     coefficients = normals * np.sqrt(n_time * spectrum)[None, :]
     return np.fft.irfft(coefficients, n=n_time, axis=1)
+
+
+def _propagate_nonlinear_rate_paths(
+    q_spectrum,
+    normals,
+    n_time,
+    dt,
+    sigma,
+    tau_u,
+    tau_s,
+    kappa,
+    E,
+    alpha,
+    J0,
+    theta,
+    delta,
+    warmup_cycles,
+):
+    """Propagate one common-random-number batch at a prescribed kernel."""
+    eta = _sample_stationary_gaussian(q_spectrum, normals, n_time)
+    n_samples = normals.shape[0]
+    u = np.zeros(n_samples, dtype=float)
+    s = np.zeros(n_samples, dtype=float)
+    mean_output = 0.5
+    paths_u = np.empty((n_samples, n_time), dtype=float)
+    paths_s = np.empty_like(paths_u)
+
+    for cycle in range(int(max(1, warmup_cycles)) + 1):
+        for index in range(n_time):
+            u, s = _nonlinear_rate_step(
+                u,
+                s,
+                sigma * eta[:, index],
+                dt,
+                tau_u,
+                tau_s,
+                kappa,
+                E,
+                alpha,
+                J0,
+                mean_output,
+            )
+            if cycle == int(max(1, warmup_cycles)):
+                paths_u[:, index] = u
+                paths_s[:, index] = s
+        mean_output = float(np.mean(sigmoid_output(u, theta, delta)))
+
+    return paths_u, paths_s, sigmoid_output(paths_u, theta, delta)
 
 
 def _nonlinear_rate_step(u, s, drive, dt, tau_u, tau_s, kappa, E, alpha, J0, mean_output):
@@ -236,6 +286,8 @@ def plot_nonlinear_rate_monte_carlo_q(
     representative_samples=1024,
     picard_reps=4,
     picard_samples=768,
+    picard_batches=1,
+    picard_validation_batches=0,
     picard_n_time=8192,
     T=400.0,
     burn=200.0,
@@ -284,10 +336,12 @@ def plot_nonlinear_rate_monte_carlo_q(
             internal_dt=0.02,
             n_time=picard_n_time,
             n_samples=picard_samples,
+            n_batches=picard_batches,
+            n_validation_batches=picard_validation_batches,
             warmup_cycles=2,
-            max_iter=300,
+            max_iter=600,
             mixing=0.15,
-            tolerance=0.008,
+            tolerance=0.002,
             spectral_smoothing=1,
             tau_max=tau_max,
             seed=271828 + 104729 * rep,
@@ -375,6 +429,7 @@ def plot_nonlinear_rate_monte_carlo_q(
         axis.set(xlabel=r"$\tau$", ylabel=ylabel, xlim=(0, tau_max))
         axis.legend(fontsize=8)
     fig.suptitle(fr"Nonlinear conductance-based rate network, $\sigma={sigma:g}$")
+    label_panels(axes)
     fig.tight_layout()
 
     figure_path = os.path.join(plot_dir, "nonlinear_rate_network.png")
@@ -400,6 +455,16 @@ def plot_nonlinear_rate_monte_carlo_q(
         Cuu_picard_sem=picard_sem["Cuu"],
         Q_picard_sem=picard_sem["Q"],
         picard_residuals=np.asarray([run[2]["final_residual"] for run in picard_runs]),
+        picard_amplitude_residuals=np.asarray(
+            [run[2]["final_amplitude_residual"] for run in picard_runs]
+        ),
+        picard_batches=int(picard_batches),
+        picard_validation_residuals=np.asarray(
+            [run[2]["validation_residual"] for run in picard_runs]
+        ),
+        picard_validation_amplitude_residuals=np.asarray(
+            [run[2]["validation_amplitude_residual"] for run in picard_runs]
+        ),
         N=int(N),
         sigma=float(sigma),
     )
@@ -420,6 +485,8 @@ def theory_nonlinear_rate_dmft(
     internal_dt=0.02,
     n_time=4096,
     n_samples=64,
+    n_batches=1,
+    n_validation_batches=0,
     warmup_cycles=2,
     max_iter=60,
     mixing=0.15,
@@ -429,20 +496,35 @@ def theory_nonlinear_rate_dmft(
     seed=271828,
     return_diagnostics=False,
 ):
-    """Solve the nonlinear rate DMFT by representative-path iteration of Q."""
+    """Solve nonlinear rate DMFT by a batched representative-path iteration."""
     if min(tau_u, tau_s, delta, internal_dt) <= 0.0:
         raise ValueError("time constants, delta, and internal_dt must be positive")
     n_time = int(max(256, n_time))
     n_samples = int(max(4, n_samples))
+    n_batches = int(max(1, n_batches))
+    n_validation_batches = int(max(0, n_validation_batches))
     local_rng = np.random.default_rng(seed)
     n_freq = n_time // 2 + 1
-    normals = (
-        local_rng.normal(size=(n_samples, n_freq))
-        + 1j * local_rng.normal(size=(n_samples, n_freq))
-    ) / np.sqrt(2.0)
-    normals[:, 0] = local_rng.normal(size=n_samples)
-    if n_time % 2 == 0:
-        normals[:, -1] = local_rng.normal(size=n_samples)
+    normal_batches = []
+    for _ in range(n_batches):
+        normals = (
+            local_rng.normal(size=(n_samples, n_freq))
+            + 1j * local_rng.normal(size=(n_samples, n_freq))
+        ) / np.sqrt(2.0)
+        normals[:, 0] = local_rng.normal(size=n_samples)
+        if n_time % 2 == 0:
+            normals[:, -1] = local_rng.normal(size=n_samples)
+        normal_batches.append(normals)
+    validation_batches = []
+    for _ in range(n_validation_batches):
+        normals = (
+            local_rng.normal(size=(n_samples, n_freq))
+            + 1j * local_rng.normal(size=(n_samples, n_freq))
+        ) / np.sqrt(2.0)
+        normals[:, 0] = local_rng.normal(size=n_samples)
+        if n_time % 2 == 0:
+            normals[:, -1] = local_rng.normal(size=n_samples)
+        validation_batches.append(normals)
 
     circular_lag = np.minimum(np.arange(n_time), n_time - np.arange(n_time))
     circular_lag = circular_lag * internal_dt
@@ -451,56 +533,116 @@ def theory_nonlinear_rate_dmft(
         np.real(np.fft.rfft(initial_variance * np.exp(-circular_lag))), 0.0
     )
     residual_history = []
+    amplitude_residual_history = []
     converged = False
-    final_paths = None
 
     for iteration in range(int(max_iter)):
-        eta = _sample_stationary_gaussian(q_spectrum, normals, n_time)
-        u = np.zeros(n_samples, dtype=float)
-        s = np.zeros(n_samples, dtype=float)
-        mean_output = 0.5
-        paths_u = np.empty((n_samples, n_time), dtype=float)
-        paths_s = np.empty_like(paths_u)
-
-        for cycle in range(int(max(1, warmup_cycles)) + 1):
-            for index in range(n_time):
-                u, s = _nonlinear_rate_step(
-                    u,
-                    s,
-                    sigma * eta[:, index],
-                    internal_dt,
-                    tau_u,
-                    tau_s,
-                    kappa,
-                    E,
-                    alpha,
-                    J0,
-                    mean_output,
-                )
-                if cycle == int(max(1, warmup_cycles)):
-                    paths_u[:, index] = u
-                    paths_s[:, index] = s
-            mean_output = float(np.mean(sigmoid_output(u, theta, delta)))
-
-        paths_output = sigmoid_output(paths_u, theta, delta)
-        proposed = _stationary_spectrum(
-            paths_output, smoothing_bins=spectral_smoothing
-        )
+        proposed = np.zeros_like(q_spectrum)
+        for normals in normal_batches:
+            _, _, paths_output = _propagate_nonlinear_rate_paths(
+                q_spectrum,
+                normals,
+                n_time,
+                internal_dt,
+                sigma,
+                tau_u,
+                tau_s,
+                kappa,
+                E,
+                alpha,
+                J0,
+                theta,
+                delta,
+                warmup_cycles,
+            )
+            proposed += _stationary_spectrum(
+                paths_output, smoothing_bins=spectral_smoothing
+            ) / n_batches
         scale = max(float(np.linalg.norm(q_spectrum)), 1e-12)
         residual = float(np.linalg.norm(proposed - q_spectrum) / scale)
+        q_variance = float(np.fft.irfft(q_spectrum, n=n_time)[0])
+        proposed_variance = float(np.fft.irfft(proposed, n=n_time)[0])
+        amplitude_residual = abs(proposed_variance - q_variance) / max(
+            abs(q_variance), 1e-12
+        )
         residual_history.append(residual)
+        amplitude_residual_history.append(amplitude_residual)
         q_spectrum = (1.0 - mixing) * q_spectrum + mixing * proposed
-        final_paths = (paths_u, paths_s, paths_output)
-        if residual < tolerance:
+        if residual < tolerance and amplitude_residual < tolerance:
             converged = True
             break
 
-    paths_u, paths_s, paths_output = final_paths
     spectra = {
-        "Cuu": _stationary_spectrum(paths_u, smoothing_bins=spectral_smoothing),
-        "Css": _stationary_spectrum(paths_s, smoothing_bins=spectral_smoothing),
-        "Q": q_spectrum,
+        "Cuu": np.zeros_like(q_spectrum),
+        "Css": np.zeros_like(q_spectrum),
+        "Q": np.zeros_like(q_spectrum),
     }
+    means = {"u": 0.0, "s": 0.0, "output": 0.0}
+    for normals in normal_batches:
+        paths_u, paths_s, paths_output = _propagate_nonlinear_rate_paths(
+            q_spectrum,
+            normals,
+            n_time,
+            internal_dt,
+            sigma,
+            tau_u,
+            tau_s,
+            kappa,
+            E,
+            alpha,
+            J0,
+            theta,
+            delta,
+            warmup_cycles,
+        )
+        for name, paths in (("Cuu", paths_u), ("Css", paths_s), ("Q", paths_output)):
+            spectra[name] += _stationary_spectrum(
+                paths, smoothing_bins=spectral_smoothing
+            ) / n_batches
+        means["u"] += float(np.mean(paths_u)) / n_batches
+        means["s"] += float(np.mean(paths_s)) / n_batches
+        means["output"] += float(np.mean(paths_output)) / n_batches
+
+    final_scale = max(float(np.linalg.norm(q_spectrum)), 1e-12)
+    final_residual = float(np.linalg.norm(spectra["Q"] - q_spectrum) / final_scale)
+    input_variance = float(np.fft.irfft(q_spectrum, n=n_time)[0])
+    output_variance = float(np.fft.irfft(spectra["Q"], n=n_time)[0])
+    final_amplitude_residual = abs(output_variance - input_variance) / max(
+        abs(input_variance), 1e-12
+    )
+    validation_residual = np.nan
+    validation_amplitude_residual = np.nan
+    if validation_batches:
+        validation_spectrum = np.zeros_like(q_spectrum)
+        for normals in validation_batches:
+            _, _, paths_output = _propagate_nonlinear_rate_paths(
+                q_spectrum,
+                normals,
+                n_time,
+                internal_dt,
+                sigma,
+                tau_u,
+                tau_s,
+                kappa,
+                E,
+                alpha,
+                J0,
+                theta,
+                delta,
+                warmup_cycles,
+            )
+            validation_spectrum += _stationary_spectrum(
+                paths_output, smoothing_bins=spectral_smoothing
+            ) / n_validation_batches
+        validation_residual = float(
+            np.linalg.norm(validation_spectrum - q_spectrum) / final_scale
+        )
+        validation_variance = float(
+            np.fft.irfft(validation_spectrum, n=n_time)[0]
+        )
+        validation_amplitude_residual = abs(
+            validation_variance - input_variance
+        ) / max(abs(input_variance), 1e-12)
     circular_covariances = {
         name: np.fft.irfft(spectrum, n=n_time) for name, spectrum in spectra.items()
     }
@@ -510,16 +652,22 @@ def theory_nonlinear_rate_dmft(
     diagnostics = {
         "converged": converged,
         "iterations": iteration + 1,
-        "final_residual": float(residual_history[-1]),
+        "final_residual": final_residual,
+        "final_amplitude_residual": final_amplitude_residual,
+        "validation_residual": validation_residual,
+        "validation_amplitude_residual": validation_amplitude_residual,
         "residual_history": np.asarray(residual_history),
-        "mean_u": float(np.mean(paths_u)),
-        "mean_s": float(np.mean(paths_s)),
-        "mean_output": float(np.mean(paths_output)),
+        "amplitude_residual_history": np.asarray(amplitude_residual_history),
+        "mean_u": means["u"],
+        "mean_s": means["s"],
+        "mean_output": means["output"],
         "spectral_smoothing": int(spectral_smoothing),
         "sigma_critical_linear": float(
             1.0 / (E * alpha * (0.25 / delta))
         ),
         "n_samples": n_samples,
+        "n_batches": n_batches,
+        "n_validation_batches": n_validation_batches,
         "n_time": n_time,
     }
     if return_diagnostics:
@@ -668,6 +816,7 @@ def plot_nonlinear_rate_network(
     axes[1, 1].set(xlabel=r"$1/N$", ylabel="equal-time covariance")
     axes[1, 1].legend(fontsize=8)
     fig.suptitle(fr"Nonlinear conductance-based rate network, $\sigma={sigma:g}$")
+    label_panels(axes)
     fig.tight_layout()
 
     figure_path = os.path.join(plot_dir, "nonlinear_rate_network.png")

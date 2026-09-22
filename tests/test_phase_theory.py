@@ -8,7 +8,25 @@ import pytest
 ROOT = Path(__file__).resolve().parents[1]
 sys.path.insert(0, str(ROOT / "scripts"))
 
-from rn_phase import theory_phase_autocorr  # noqa: E402
+from rn_phase import sim_phase_network, theory_phase_autocorr  # noqa: E402
+
+
+def test_phase_network_returns_event_kernel_and_distinct_event_part():
+    tau, covariance, event, event_off, mean_rate = sim_phase_network(
+        N=16,
+        sigma=0.2,
+        T=4.0,
+        burn=2.0,
+        dt=0.05,
+        tau_max=0.2,
+        n_probe=8,
+        return_event=True,
+        rng=np.random.default_rng(17),
+    )
+
+    assert tau.shape == covariance.shape == event.shape == event_off.shape
+    assert event_off[0] == pytest.approx(event[0] - mean_rate / 0.05)
+    assert mean_rate >= 0.0
 
 
 def test_phase_theory_obeys_same_spike_cusp():
@@ -179,6 +197,8 @@ def test_twotime_dmft_solver_retains_uncoupled_phase_memory():
     )
 
     C33 = diagnostics["phase_density_covariance"]
+    assert diagnostics["event_covariance"].shape == C33.shape
+    assert diagnostics["off_event_covariance"].shape == C33.shape
     return_bin = int(round((2.0 * np.pi) / 0.1))
     assert np.all(covariance == 0.0)
     assert np.max(C33[return_bin - 2:return_bin + 3]) > 0.8 * C33[0]

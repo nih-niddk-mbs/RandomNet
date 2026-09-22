@@ -11,9 +11,11 @@ sys.path.insert(0, str(ROOT / "scripts"))
 from rn_binary import (  # noqa: E402
     _conditional_binary_spectrum,
     _periodic_binary_probability,
+    sim_binary_saturating_network,
     sigmoid_rate,
     sigmoid_tangent_parameters,
     theory_binary_autocorr,
+    theory_binary_saturating_dmft,
     theory_binary_sigmoid_dmft,
 )
 
@@ -100,6 +102,39 @@ def test_sigmoid_dmft_returns_positive_semidefinite_spectra():
     assert np.min(diagnostics["state_spectrum"]) >= 0.0
     assert np.min(diagnostics["drive_spectrum"]) >= 0.0
     assert diagnostics["conditional_method"] == "exact_master_equation"
+
+
+def test_saturating_binary_dmft_and_network_return_kernel_and_gate_covariance():
+    tau, Qbin, Css, diagnostics = theory_binary_saturating_dmft(
+        sigma=0.6,
+        tau_max=0.5,
+        dtau=0.05,
+        internal_dt=0.05,
+        n_time=512,
+        n_samples=8,
+        max_iter=4,
+        return_diagnostics=True,
+        seed=23,
+    )
+    tau_sim, Qbin_sim, Css_sim = sim_binary_saturating_network(
+        N=24,
+        sigma=0.6,
+        T=3.0,
+        burn=1.0,
+        dt=0.05,
+        n_probe=8,
+        tau_max=0.5,
+        rng=np.random.default_rng(29),
+    )
+
+    assert tau.shape == Qbin.shape == Css.shape
+    assert tau_sim.shape == Qbin_sim.shape == Css_sim.shape
+    assert np.all(np.isfinite(Qbin))
+    assert np.all(np.isfinite(Css))
+    assert np.all(np.isfinite(Qbin_sim))
+    assert np.all(np.isfinite(Css_sim))
+    assert np.min(diagnostics["state_spectrum"]) >= 0.0
+    assert diagnostics["conditional_method"] == "exact_master_equation_and_gate_map"
 
 
 def test_affine_residues_define_a_valid_subcritical_covariance():

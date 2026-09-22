@@ -6,7 +6,7 @@ import matplotlib.pyplot as plt
 import numpy as np
 from scipy.special import expit
 
-from rn_core import autocorr, default_results_dir, make_weights, rng
+from rn_core import autocorr, default_results_dir, label_panels, make_weights, rng
 
 
 def sigmoid_rate(u, rate_max=1.0, theta=0.0, delta=0.25):
@@ -102,6 +102,80 @@ def sim_binary_network(
         [autocorr(spikes[:, i] / dt, max_lag) for i in range(n_probe)], axis=0
     )
     return tau, Cnn, Cuu, Cspk
+
+
+def sim_binary_saturating_network(
+    N=800,
+    sigma=0.8,
+    tau_s=1.0,
+    alpha=0.5,
+    J0=0.5,
+    mu=1.0,
+    rate_max=1.0,
+    theta=0.0,
+    delta=0.25,
+    T=1000.0,
+    dt=0.02,
+    lam=1,
+    burn=200.0,
+    n_probe=64,
+    tau_max=20.0,
+    rng=rng,
+):
+    """Simulate the binary network with a multiplicative saturating gate."""
+    if dt <= 0.0 or T <= 0.0 or tau_s <= 0.0:
+        raise ValueError("dt, T, and tau_s must be positive")
+    if alpha <= 0.0 or mu <= 0.0:
+        raise ValueError("alpha and mu must be positive")
+
+    W = make_weights(N, sigma, lam, rng)
+    n = rng.integers(0, 2, N).astype(float)
+    s = np.full(N, 0.1, dtype=float)
+    random_drive = W @ n
+
+    def step():
+        nonlocal n, s, random_drive
+        rate = sigmoid_rate(s, rate_max=rate_max, theta=theta, delta=delta)
+        gamma = rate + mu
+        relax = 1.0 - np.exp(-gamma * dt)
+        p_on = rate / gamma * relax
+        p_off = mu / gamma * relax
+        draws = rng.random(N)
+        old_n = n.copy()
+        n = np.where(old_n > 0.5, draws >= p_off, draws < p_on).astype(float)
+        delta_n = n - old_n
+        changed = np.flatnonzero(delta_n)
+        if len(changed):
+            random_drive += W[:, changed] @ delta_n[changed]
+
+        transmitter = J0 * np.mean(n) + random_drive
+        relaxation = (1.0 + alpha * transmitter) / tau_s
+        forcing = alpha * transmitter / tau_s
+        decay = np.exp(-relaxation * dt)
+        increment = np.empty_like(transmitter)
+        regular = np.abs(relaxation) > 1e-10
+        increment[regular] = (
+            forcing[regular] * (1.0 - decay[regular]) / relaxation[regular]
+        )
+        increment[~regular] = forcing[~regular] * dt
+        s = decay * s + increment
+
+    for _ in range(int(burn / dt)):
+        step()
+
+    nt = int(T / dt)
+    n_probe = int(max(1, min(N, n_probe)))
+    states = np.empty((nt, n_probe), dtype=np.float32)
+    gates = np.empty((nt, n_probe), dtype=np.float32)
+    for index in range(nt):
+        step()
+        states[index] = n[:n_probe]
+        gates[index] = s[:n_probe]
+
+    max_lag = min(int(tau_max / dt), nt - 1)
+    Cnn = np.mean([autocorr(states[:, i], max_lag) for i in range(n_probe)], axis=0)
+    Css = np.mean([autocorr(gates[:, i], max_lag) for i in range(n_probe)], axis=0)
+    return np.arange(len(Cnn)) * dt, Cnn, Css
 
 
 def theory_binary_autocorr(sigma, beta, mu, f0, f1, tau_max=30, dtau=0.001):
@@ -361,6 +435,137 @@ def theory_binary_sigmoid_dmft(
     return output_tau, Cnn, Cuu, sigma_critical
 
 
+def _periodic_saturating_gate(transmitter, tau_s, alpha, dt):
+    """Integrate the exact affine gate map with a periodic initial state."""
+    relaxation = (1.0 + alpha * transmitter) / tau_s
+    forcing = alpha * transmitter / tau_s
+    decay = np.exp(-relaxation * dt)
+    increment = np.empty_like(transmitter)
+    regular = np.abs(relaxation) > 1e-10
+    increment[regular] = (
+        forcing[regular] * (1.0 - decay[regular]) / relaxation[regular]
+    )
+    increment[~regular] = forcing[~regular] * dt
+
+    accumulated = np.zeros(transmitter.shape[0])
+    multiplier = np.ones(transmitter.shape[0])
+    for index in range(transmitter.shape[1]):
+        accumulated = decay[:, index] * accumulated + increment[:, index]
+        multiplier *= decay[:, index]
+    denominator = 1.0 - multiplier
+    if np.any(np.abs(denominator) < 1e-10):
+        raise RuntimeError("saturating-gate periodic map is marginal")
+
+    gate = accumulated / denominator
+    gates = np.empty_like(transmitter)
+    for index in range(transmitter.shape[1]):
+        gates[:, index] = gate
+        gate = decay[:, index] * gate + increment[:, index]
+    return gates
+
+
+def theory_binary_saturating_dmft(
+    sigma,
+    tau_s=1.0,
+    alpha=0.5,
+    J0=0.5,
+    mu=1.0,
+    rate_max=1.0,
+    theta=0.0,
+    delta=0.25,
+    tau_max=20.0,
+    dtau=0.05,
+    internal_dt=0.025,
+    n_time=8192,
+    n_samples=256,
+    max_iter=80,
+    mixing=0.15,
+    tolerance=0.01,
+    seed=314159,
+    return_diagnostics=False,
+):
+    """Solve the representative-process fixed point for the saturating gate."""
+    if internal_dt <= 0.0 or tau_s <= 0.0 or dtau <= 0.0:
+        raise ValueError("time steps and tau_s must be positive")
+    n_time = int(max(256, n_time))
+    n_samples = int(max(4, n_samples))
+    dt = float(internal_dt)
+
+    local_rng = np.random.default_rng(seed)
+    n_freq = n_time // 2 + 1
+    normals = (
+        local_rng.normal(size=(n_samples, n_freq))
+        + 1j * local_rng.normal(size=(n_samples, n_freq))
+    ) / np.sqrt(2.0)
+    normals[:, 0] = local_rng.normal(size=n_samples)
+    if n_time % 2 == 0:
+        normals[:, -1] = local_rng.normal(size=n_samples)
+
+    rate0 = float(sigmoid_rate(0.0, rate_max, theta, delta))
+    gamma0 = rate0 + mu
+    mean_activity = rate0 / gamma0
+    circular_lag = np.minimum(np.arange(n_time), n_time - np.arange(n_time)) * dt
+    covariance0 = mean_activity * (1.0 - mean_activity) * np.exp(
+        -gamma0 * circular_lag
+    )
+    state_spectrum = np.maximum(np.real(np.fft.rfft(covariance0)), 0.0)
+
+    history = []
+    converged = False
+    gates = None
+    probabilities = None
+    for iteration in range(int(max_iter)):
+        eta = _sample_stationary_gaussian(state_spectrum, normals, n_time)
+        transmitter = J0 * mean_activity + sigma * eta
+        gates = _periodic_saturating_gate(transmitter, tau_s, alpha, dt)
+        rates = sigmoid_rate(gates, rate_max, theta, delta)
+        proposed, probabilities, _intrinsic = _conditional_binary_spectrum(
+            rates, mu, dt
+        )
+        proposed_mean = float(np.mean(probabilities))
+        spectral_scale = max(float(np.linalg.norm(state_spectrum)), 1e-12)
+        spectral_residual = float(
+            np.linalg.norm(proposed - state_spectrum) / spectral_scale
+        )
+        mean_residual = abs(proposed_mean - mean_activity)
+        residual = max(spectral_residual, mean_residual)
+        history.append(residual)
+        state_spectrum = (1.0 - mixing) * state_spectrum + mixing * proposed
+        mean_activity = (1.0 - mixing) * mean_activity + mixing * proposed_mean
+        if residual < tolerance:
+            converged = True
+            break
+
+    state_covariance = np.fft.irfft(state_spectrum, n=n_time)
+    gate_centered = gates - np.mean(gates)
+    gate_transform = np.fft.rfft(gate_centered, axis=1)
+    gate_spectrum = np.mean(np.abs(gate_transform) ** 2, axis=0) / n_time
+    gate_covariance = np.fft.irfft(gate_spectrum, n=n_time)
+
+    output_tau = np.arange(0.0, tau_max, dtau)
+    max_internal_lag = min(int(np.ceil(tau_max / dt)) + 1, n_time // 2)
+    internal_tau = np.arange(max_internal_lag) * dt
+    Cnn = np.interp(output_tau, internal_tau, state_covariance[:max_internal_lag])
+    Css = np.interp(output_tau, internal_tau, gate_covariance[:max_internal_lag])
+    diagnostics = dict(
+        converged=converged,
+        iterations=iteration + 1,
+        residual_history=np.asarray(history),
+        final_residual=float(history[-1]),
+        mean_activity=mean_activity,
+        internal_dt=dt,
+        n_time=n_time,
+        n_samples=n_samples,
+        state_spectrum=state_spectrum,
+        gate_spectrum=gate_spectrum,
+        sample_probabilities=probabilities,
+        conditional_method="exact_master_equation_and_gate_map",
+    )
+    if return_diagnostics:
+        return output_tau, Cnn, Css, diagnostics
+    return output_tau, Cnn, Css
+
+
 def _normalized(covariance):
     covariance = np.asarray(covariance, dtype=float)
     return covariance / covariance[0] if abs(covariance[0]) > 1e-12 else covariance
@@ -445,14 +650,14 @@ def plot_binary_network(
         )
         g0 = sigma / diagnostics["sigma_critical_tangent"]
         axes[0, column].plot(
-            tau_sim, _normalized(Cnn_sim), color="k", lw=1.8, label="simulation"
+            tau_sim, Cnn_sim, color="k", lw=1.8, label="simulation"
         )
         axes[0, column].plot(
-            tau_th, _normalized(Cnn_th), color="C3", lw=2.2, label="dynamic DMFT"
+            tau_th, Cnn_th, color="C3", lw=2.2, label="dynamic DMFT"
         )
         axes[0, column].set(
             title=fr"$\sigma={sigma:g},\ g_0={g0:.2f}$",
-            ylabel=r"$C_{nn}(\tau)/C_{nn}(0)$",
+            ylabel=r"$Q_{\rm bin}(\tau)$",
             xlim=(0, tau_max),
         )
         axes[0, column].legend(fontsize=8)
@@ -470,6 +675,7 @@ def plot_binary_network(
         axes[1, column].legend(fontsize=8)
 
     fig.suptitle("Sigmoid binary network: dynamic 2PI-DMFT", fontsize=13, fontweight="bold")
+    label_panels(axes)
     fig.tight_layout()
     output = os.path.join(plot_dir, "binary_network_test.png")
     fig.savefig(output, dpi=160)
@@ -510,7 +716,7 @@ def plot_binary_network_N_convergence(
     )
     colors = plt.cm.viridis(np.linspace(0.1, 0.9, len(N_vals)))
     fig, axes = plt.subplots(1, 2, figsize=(11.5, 4.5))
-    axes[0].plot(tau_th, _normalized(Cnn_th), color="C3", lw=2.8, label="dynamic DMFT")
+    axes[0].plot(tau_th, Cnn_th, color="C3", lw=2.8, label="dynamic DMFT")
     axes[1].plot(tau_th, _normalized(Cuu_th), color="C3", lw=2.8, label="dynamic DMFT")
     for index, (N, color) in enumerate(zip(N_vals, colors)):
         tau, Cnn, Cuu = sim_binary_network(
@@ -527,11 +733,11 @@ def plot_binary_network_N_convergence(
             tau_max=tau_max,
             rng=np.random.default_rng(5000 + index),
         )
-        axes[0].plot(tau, _normalized(Cnn), color=color, lw=1.4, label=fr"$N={N}$")
+        axes[0].plot(tau, Cnn, color=color, lw=1.4, label=fr"$N={N}$")
         axes[1].plot(tau, _normalized(Cuu), color=color, lw=1.4, label=fr"$N={N}$")
     axes[0].set(
-        xlabel=r"$\tau$", ylabel=r"$C_{nn}(\tau)/C_{nn}(0)$",
-        title="state covariance", xlim=(0, tau_max)
+        xlabel=r"$\tau$", ylabel=r"$Q_{\rm bin}(\tau)$",
+        title=r"output kernel $Q_{\rm bin}=C_{nn}$", xlim=(0, tau_max)
     )
     axes[1].set(
         xlabel=r"$\tau$", ylabel=r"$C_{uu}(\tau)/C_{uu}(0)$",
@@ -545,6 +751,7 @@ def plot_binary_network_N_convergence(
         fontsize=13,
         fontweight="bold",
     )
+    label_panels(axes)
     fig.tight_layout()
     output = os.path.join(plot_dir, "binary_network_N_convergence.png")
     fig.savefig(output, dpi=160)
@@ -572,11 +779,11 @@ def plot_binary_theory_hierarchy(
         plot_dir = default_results_dir()
     os.makedirs(plot_dir, exist_ok=True)
     theory_kwargs = {} if theory_kwargs is None else dict(theory_kwargs)
-    fig, axes = plt.subplots(1, len(sigma_vals), figsize=(5.0 * len(sigma_vals), 4.2))
+    fig, axes = plt.subplots(2, len(sigma_vals), figsize=(5.0 * len(sigma_vals), 7.5))
     if len(sigma_vals) == 1:
-        axes = [axes]
-    for index, (axis, sigma) in enumerate(zip(axes, sigma_vals)):
-        tau_dmft, Cnn_dmft, _Cuu, diagnostics = theory_binary_sigmoid_dmft(
+        axes = np.asarray(axes).reshape(2, 1)
+    for index, sigma in enumerate(sigma_vals):
+        tau_dmft, Cnn_dmft, Cuu_dmft, diagnostics = theory_binary_sigmoid_dmft(
             sigma=sigma,
             beta=beta,
             mu=mu,
@@ -587,7 +794,7 @@ def plot_binary_theory_hierarchy(
             return_diagnostics=True,
             **theory_kwargs,
         )
-        tau_affine, Cnn_affine, _Cuu_affine, _g = theory_binary_sigmoid_tangent(
+        tau_affine, Cnn_affine, Cuu_affine, _g = theory_binary_sigmoid_tangent(
             sigma=sigma,
             beta=beta,
             mu=mu,
@@ -597,7 +804,7 @@ def plot_binary_theory_hierarchy(
             tau_max=tau_max,
             dtau=max(dt, 0.05),
         )
-        tau_sim, Cnn_sim, _Cuu_sim = _binary_simulation_average(
+        tau_sim, Cnn_sim, Cuu_sim = _binary_simulation_average(
             sigma,
             1,
             8000 + index,
@@ -612,22 +819,176 @@ def plot_binary_theory_hierarchy(
             dt=dt,
             tau_max=tau_max,
         )
-        axis.plot(tau_sim, _normalized(Cnn_sim), color="k", lw=1.8, label="simulation")
-        axis.plot(tau_dmft, _normalized(Cnn_dmft), color="C3", lw=2.3, label="nonlinear DMFT")
+        ax_q = axes[0, index]
+        ax_c = axes[1, index]
+        ax_q.plot(tau_sim, Cnn_sim, color="k", lw=1.8, label="simulation")
+        ax_q.plot(tau_dmft, Cnn_dmft, color="C3", lw=2.3, label="nonlinear DMFT")
+        ax_c.plot(tau_sim, _normalized(Cuu_sim), color="k", lw=1.8, label="simulation")
+        ax_c.plot(tau_dmft, _normalized(Cuu_dmft), color="C3", lw=2.3, label="nonlinear DMFT")
         if np.all(np.isfinite(Cnn_affine)):
-            axis.plot(
-                tau_affine, _normalized(Cnn_affine), color="0.65", ls=":",
+            ax_q.plot(
+                tau_affine, Cnn_affine, color="0.65", ls=":",
+                lw=2.0, label="sigmoid tangent"
+            )
+            ax_c.plot(
+                tau_affine, _normalized(Cuu_affine), color="0.65", ls=":",
                 lw=2.0, label="sigmoid tangent"
             )
         g0 = sigma / diagnostics["sigma_critical_tangent"]
-        axis.set(
-            xlabel=r"$\tau$", ylabel=r"$C_{nn}(\tau)/C_{nn}(0)$",
+        ax_q.set(
+            ylabel=r"$Q_{\rm bin}(\tau)$",
             title=fr"$\sigma={sigma:g},\ g_0={g0:.2f}$", xlim=(0, tau_max)
         )
-        axis.legend(fontsize=8)
+        ax_c.set(
+            xlabel=r"$\tau$", ylabel=r"$C_{uu}(\tau)/C_{uu}(0)$",
+            xlim=(0, tau_max)
+        )
+        ax_q.legend(fontsize=8)
+        ax_c.legend(fontsize=8)
     fig.suptitle("Sigmoid binary network: controlled theory hierarchy", fontsize=13, fontweight="bold")
+    label_panels(axes)
     fig.tight_layout()
     output = os.path.join(plot_dir, "binary_theory_hierarchy.png")
+    fig.savefig(output, dpi=160)
+    plt.close(fig)
+    print(f"Saved to {output}")
+
+
+def plot_binary_saturating_comparison(
+    sigma_vals=(0.4, 0.8, 1.2),
+    N=800,
+    tau_s=1.0,
+    alpha=0.5,
+    J0=0.5,
+    mu=1.0,
+    rate_max=1.0,
+    theta=0.0,
+    delta=0.25,
+    T=1500.0,
+    burn=300.0,
+    dt=0.02,
+    tau_max=20.0,
+    sim_reps=2,
+    theory_kwargs=None,
+    plot_dir=None,
+):
+    """Compare the composite binary kernel and gate covariance directly."""
+    if plot_dir is None:
+        plot_dir = default_results_dir()
+    os.makedirs(plot_dir, exist_ok=True)
+    theory_kwargs = {} if theory_kwargs is None else dict(theory_kwargs)
+    fig, axes = plt.subplots(2, len(sigma_vals), figsize=(5.0 * len(sigma_vals), 7.5))
+    if len(sigma_vals) == 1:
+        axes = np.asarray(axes).reshape(2, 1)
+
+    for column, sigma in enumerate(sigma_vals):
+        tau_theory, Q_theory, Css_theory, diagnostics = (
+            theory_binary_saturating_dmft(
+                sigma=sigma,
+                tau_s=tau_s,
+                alpha=alpha,
+                J0=J0,
+                mu=mu,
+                rate_max=rate_max,
+                theta=theta,
+                delta=delta,
+                tau_max=tau_max,
+                return_diagnostics=True,
+                **theory_kwargs,
+            )
+        )
+        runs = [
+            sim_binary_saturating_network(
+                N=N,
+                sigma=sigma,
+                tau_s=tau_s,
+                alpha=alpha,
+                J0=J0,
+                mu=mu,
+                rate_max=rate_max,
+                theta=theta,
+                delta=delta,
+                T=T,
+                burn=burn,
+                dt=dt,
+                n_probe=min(N, 256),
+                tau_max=tau_max,
+                rng=np.random.default_rng(12000 + 101 * column + replicate),
+            )
+            for replicate in range(int(sim_reps))
+        ]
+        tau_sim = runs[0][0]
+        Q_sim = np.mean([run[1] for run in runs], axis=0)
+        Css_sim = np.mean([run[2] for run in runs], axis=0)
+        Q_at_sim = np.interp(tau_sim, tau_theory, Q_theory)
+        Css_at_sim = np.interp(tau_sim, tau_theory, Css_theory)
+        Q_nrmse = np.sqrt(np.mean((Q_at_sim - Q_sim) ** 2)) / max(
+            np.sqrt(np.mean(Q_sim**2)), 1e-12
+        )
+        Css_nrmse = np.sqrt(np.mean((Css_at_sim - Css_sim) ** 2)) / max(
+            np.sqrt(np.mean(Css_sim**2)), 1e-12
+        )
+
+        axes[0, column].plot(
+            tau_sim, Q_sim, color="k", lw=2.0, label="simulation"
+        )
+        axes[0, column].plot(
+            tau_theory,
+            Q_theory,
+            color="C3",
+            lw=2.2,
+            label="representative process",
+        )
+        axes[1, column].plot(
+            tau_sim, Css_sim, color="k", lw=2.0, label="simulation"
+        )
+        axes[1, column].plot(
+            tau_theory,
+            Css_theory,
+            color="C3",
+            lw=2.2,
+            label="representative process",
+        )
+        axes[0, column].set(
+            title=fr"$\sigma={sigma:g}$",
+            ylabel=r"$Q_{\rm bin}(\tau)$",
+            xlim=(0.0, tau_max),
+        )
+        axes[1, column].set(
+            xlabel=r"$\tau$",
+            ylabel=r"$C_{ss}(\tau)$",
+            xlim=(0.0, tau_max),
+        )
+        axes[0, column].legend(fontsize=8)
+        axes[1, column].legend(fontsize=8)
+        axes[0, column].text(
+            0.98,
+            0.76,
+            fr"nRMSE $={Q_nrmse:.3f}$",
+            transform=axes[0, column].transAxes,
+            ha="right",
+            va="top",
+            fontsize=8,
+        )
+        axes[1, column].text(
+            0.98,
+            0.94,
+            f"nRMSE $={Css_nrmse:.3f}$\n"
+            f"residual $={diagnostics['final_residual']:.3g}$",
+            transform=axes[1, column].transAxes,
+            ha="right",
+            va="top",
+            fontsize=8,
+        )
+
+    fig.suptitle(
+        "Binary network with a saturating recurrent gate",
+        fontsize=13,
+        fontweight="bold",
+    )
+    label_panels(axes)
+    fig.tight_layout()
+    output = os.path.join(plot_dir, "binary_saturating_comparison.png")
     fig.savefig(output, dpi=160)
     plt.close(fig)
     print(f"Saved to {output}")

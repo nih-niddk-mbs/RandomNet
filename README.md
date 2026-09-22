@@ -9,8 +9,9 @@ directory rather than in this repository.
 - `scripts/rn_core.py`: row-sum-corrected random weights and correlation helpers.
 - `scripts/rn_rate.py`: nonlinear conductance-based rate-network simulation,
   representative-path DMFT, and the scalar SCS reference calculation.
-- `scripts/rn_binary.py`: sigmoid binary-network simulation, dynamic DMFT,
-  and the controlled affine-tangent benchmark.
+- `scripts/rn_binary.py`: direct and saturating-gate binary-network
+  simulations, representative-process DMFT, and the controlled affine-tangent
+  benchmark.
 - `scripts/rn_phase.py`: threshold-reset simulation, stationary and full
   two-time event-DMFT closures, general phase laws, transformed theta/QIF,
   LIF event sampling, and tangent chaos diagnostics.
@@ -33,7 +34,13 @@ directory rather than in this repository.
 
 The nonlinear rate DMFT iterates the output kernel `Q` using common stationary
 Gaussian drive paths and integrates the coupled neuronal and saturating
-synaptic variables. Its diagnostics report the spectral fixed-point residual.
+synaptic variables. Set `n_batches > 1` to average the DMFT map over independent
+common-random-number batches before each Picard update. Its diagnostics report
+both the full spectral residual and the separate zero-lag amplitude residual;
+optional held-out batches report independent residuals, and the returned
+observables are reevaluated at the final input kernel. Because covariance paths
+are centered separately, Gaussian synthesis keeps their finite-window DC mode
+at zero rather than adding an inconsistent random static offset.
 `nonlinear_rate_fixed_q_response` instead holds a kernel measured from network
 output paths fixed, allowing errors in the Gaussian single-site reduction to
 be separated from errors in the numerical self-consistency iteration.
@@ -48,6 +55,12 @@ exact conditional Bernoulli covariance. Binary jump histories are not sampled.
 Common Gaussian paths are retained during fixed-point iteration, and the
 diagnostics report the spectral residual and
 `conditional_method="exact_master_equation"`.
+
+For the composite binary model, the same iteration drives the exact
+constant-input map of the saturating synaptic gate before solving the
+conditional two-state master equation. The paper comparison reports the
+directly closed kernel `Q_bin = Cnn` and the resulting gate covariance `Css`
+separately.
 
 The stationary phase event-DMFT solver uses common-random-number Fourier
 synthesis, deterministic phase advection, complete threshold event counts,

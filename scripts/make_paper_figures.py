@@ -50,6 +50,7 @@ from rn_phase import (  # noqa: E402
 from rn_binary import (  # noqa: E402
     plot_binary_network,
     plot_binary_network_N_convergence,
+    plot_binary_saturating_comparison,
     plot_binary_theory_hierarchy,
 )
 from make_chaos_figures import CHAOS_FIGURE_FILES, make_chaos_figures  # noqa: E402
@@ -68,6 +69,7 @@ PAPER_FIGURE_FILES = (
     "fig02_binary_sigmoid.png",
     "fig03_binary_N_convergence.png",
     "fig04_binary_hierarchy.png",
+    "fig04_binary_saturating.png",
     "fig05_phase_closure_comparison.png",
     "fig06_phase_theory_examples.png",
     "fig07_phase_theory_comparison.png",
@@ -95,6 +97,7 @@ PAPER_FIGURE_GROUPS = (
     "binary",
     "binary-conv",
     "binary-hierarchy",
+    "binary-saturating",
     "chaos",
     "first-passage",
 )
@@ -228,8 +231,10 @@ def make_figures(profile: str, figures: set[str], plot_dir: Path, jobs: int) -> 
             sim_reps=1 if quick else 4,
             representative_reps=1 if quick else 4,
             representative_samples=16 if quick else 1024,
-            picard_reps=1 if quick else 4,
+            picard_reps=1,
             picard_samples=16 if quick else 768,
+            picard_batches=1 if quick else 4,
+            picard_validation_batches=0 if quick else 2,
             picard_n_time=1024 if quick else 8192,
             n_probe=96 if quick else 384,
             plot_dir=str(plot_dir),
@@ -464,6 +469,33 @@ def make_figures(profile: str, figures: set[str], plot_dir: Path, jobs: int) -> 
             plot_dir=str(plot_dir),
         )
         _copy_named(plot_dir, "binary_theory_hierarchy.png", "fig04_binary_hierarchy.png", manifest)
+
+    if "binary-saturating" in figures:
+        print("\n[binary saturating] direct Q and gate-covariance comparison")
+        plot_binary_saturating_comparison(
+            sigma_vals=(0.4, 0.8, 1.2),
+            N=binary_N,
+            T=250.0 if quick else 1800.0,
+            burn=50.0 if quick else 300.0,
+            dt=0.05 if quick else 0.02,
+            tau_max=12.0 if quick else 20.0,
+            sim_reps=1 if quick else 3,
+            theory_kwargs=dict(
+                internal_dt=0.05 if quick else 0.025,
+                n_time=1024 if quick else 8192,
+                n_samples=16 if quick else 256,
+                max_iter=25 if quick else 80,
+                mixing=0.22 if quick else 0.15,
+                tolerance=0.05 if quick else 0.01,
+            ),
+            plot_dir=str(plot_dir),
+        )
+        _copy_named(
+            plot_dir,
+            "binary_saturating_comparison.png",
+            "fig04_binary_saturating.png",
+            manifest,
+        )
 
     if "chaos" in figures:
         print("\n[chaos] transformed-theta and LIF stability calculations")

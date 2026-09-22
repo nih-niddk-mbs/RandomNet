@@ -57,6 +57,7 @@ def test_figure_names_match_manuscript_order():
         "fig02_binary_sigmoid.png",
         "fig03_binary_N_convergence.png",
         "fig04_binary_hierarchy.png",
+        "fig04_binary_saturating.png",
         "fig05_phase_closure_comparison.png",
         "fig06_phase_theory_examples.png",
         "fig07_phase_theory_comparison.png",
@@ -96,6 +97,8 @@ def test_nonlinear_rate_simulation_and_dmft_are_finite():
         internal_dt=0.05,
         n_time=256,
         n_samples=4,
+        n_batches=2,
+        n_validation_batches=1,
         warmup_cycles=1,
         max_iter=2,
         tau_max=1.0,
@@ -107,6 +110,10 @@ def test_nonlinear_rate_simulation_and_dmft_are_finite():
     assert np.all(np.isfinite(simulation["Q"]))
     assert np.all(np.isfinite(theory["Q"]))
     assert diagnostics["sigma_critical_linear"] == 1.0
+    assert diagnostics["n_batches"] == 2
+    assert diagnostics["n_validation_batches"] == 1
+    assert np.isfinite(diagnostics["final_amplitude_residual"])
+    assert np.isfinite(diagnostics["validation_residual"])
 
 
 def test_nonlinear_rate_fixed_q_response_keeps_input_and_output_separate():

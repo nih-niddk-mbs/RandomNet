@@ -8,7 +8,9 @@ from pathlib import Path
 import matplotlib.pyplot as plt
 import numpy as np
 
+from rn_core import label_panels
 from rn_phase import (
+    _off_event_curve,
     _sim_phase_timeseries,
     maximal_lyapunov_phase_network,
     phase_replica_stability_dmft,
@@ -250,6 +252,7 @@ def plot_spiking_activity(
         axes[1, column].set_xlabel("time")
     axes[0, 0].set_ylabel("neuron")
     axes[1, 0].set_ylabel(r"$u_i(t)$")
+    label_panels(axes)
     fig.tight_layout()
     fig.savefig(output_path, dpi=180)
     plt.close(fig)
@@ -279,7 +282,14 @@ def compute_spiking_covariance_comparison(
     phase_bin_width=0.25,
 ):
     """Compute C11 and threshold-density C33 from simulation and DMFT."""
-    tau_sim, C11_sim, C33_sim = sim_phase_network(
+    (
+        tau_sim,
+        C11_sim,
+        _Q_sim,
+        Qoff_sim,
+        mean_rate_sim,
+        C33_sim,
+    ) = sim_phase_network(
         N=N,
         I=I,
         sigma=sigma,
@@ -289,6 +299,7 @@ def compute_spiking_covariance_comparison(
         dt=dt,
         tau_max=tau_max,
         n_probe=n_probe,
+        return_event=True,
         return_phase_density=True,
         phase_bin_width=phase_bin_width,
         phase_model=phase_model,
@@ -324,9 +335,16 @@ def compute_spiking_covariance_comparison(
         phase_model=str(phase_model),
         tau_sim=tau_sim,
         C11_sim=C11_sim,
+        Qoff_sim=Qoff_sim,
+        mean_rate_sim=mean_rate_sim,
         C33_sim=C33_sim,
         tau_stationary=tau_stationary,
         C11_stationary=C11_stationary,
+        Qoff_stationary=diagnostic_stationary["off_event_covariance"],
+        tau_Q_stationary=(
+            np.arange(len(diagnostic_stationary["off_event_covariance"]))
+            * diagnostic_stationary["internal_dt"]
+        ),
         C33_stationary=diagnostic_stationary["phase_density_covariance"],
         tau_C33_stationary=(
             np.arange(len(diagnostic_stationary["phase_density_covariance"]))
@@ -363,6 +381,11 @@ def compute_spiking_covariance_comparison(
         result.update(
             tau_twotime=tau_twotime,
             C11_twotime=C11_twotime,
+            Qoff_twotime=diagnostic_twotime["off_event_covariance"],
+            tau_Q_twotime=(
+                np.arange(len(diagnostic_twotime["off_event_covariance"]))
+                * diagnostic_twotime["internal_dt"]
+            ),
             C33_twotime=diagnostic_twotime["phase_density_covariance"],
             tau_C33_twotime=(
                 np.arange(len(diagnostic_twotime["phase_density_covariance"]))
@@ -381,10 +404,10 @@ def compute_theta_covariance_comparison(*args, **kwargs):
 
 
 def plot_spiking_covariance_comparison(results, output_path):
-    """Plot C11 and C33 with simulation visually dominant."""
-    fig, axes = plt.subplots(2, len(results), figsize=(5.2 * len(results), 7.0))
+    """Plot C11, the event kernel, and C33 with simulation dominant."""
+    fig, axes = plt.subplots(3, len(results), figsize=(5.2 * len(results), 10.0))
     if len(results) == 1:
-        axes = axes.reshape(2, 1)
+        axes = axes.reshape(3, 1)
     for column, result in enumerate(results):
         axes[0, column].plot(
             result["tau_sim"], result["C11_sim"], color="k", lw=2.4, label="simulation"
@@ -406,9 +429,29 @@ def plot_spiking_covariance_comparison(results, output_path):
                 label="two-time event-DMFT",
             )
         axes[1, column].plot(
-            result["tau_sim"], result["C33_sim"], color="k", lw=2.4
+            result["tau_sim"],
+            _off_event_curve(result["Qoff_sim"]),
+            color="k",
+            lw=2.4,
         )
         axes[1, column].plot(
+            result["tau_Q_stationary"],
+            _off_event_curve(result["Qoff_stationary"]),
+            color="C0",
+            lw=2.0,
+            ls="--",
+        )
+        if "tau_Q_twotime" in result:
+            axes[1, column].plot(
+                result["tau_Q_twotime"],
+                _off_event_curve(result["Qoff_twotime"]),
+                color="C3",
+                lw=1.5,
+            )
+        axes[2, column].plot(
+            result["tau_sim"], result["C33_sim"], color="k", lw=2.4
+        )
+        axes[2, column].plot(
             result["tau_C33_stationary"],
             result["C33_stationary"],
             color="C0",
@@ -416,20 +459,24 @@ def plot_spiking_covariance_comparison(results, output_path):
             ls="--",
         )
         if "tau_C33_twotime" in result:
-            axes[1, column].plot(
+            axes[2, column].plot(
                 result["tau_C33_twotime"],
                 result["C33_twotime"],
                 color="C3",
                 lw=1.5,
             )
         axes[0, column].set_title(fr"$\sigma={result['sigma']:g}$")
-        axes[1, column].set_xlabel(r"lag $\tau$")
-        axes[1, column].set_xlim(0.0, result["tau_sim"][-1])
-        axes[0, column].grid(alpha=0.18)
-        axes[1, column].grid(alpha=0.18)
+        axes[2, column].set_xlabel(r"lag $\tau$")
+        for row in range(3):
+            axes[row, column].set_xlim(0.0, result["tau_sim"][-1])
+            axes[row, column].grid(alpha=0.18)
     axes[0, 0].set_ylabel(r"$C_{11}(\tau)$")
-    axes[1, 0].set_ylabel(r"$C_{33}(\tau)$")
+    axes[1, 0].set_ylabel(
+        r"$Q_{\nu,\mathrm{off}}(\tau)$"
+    )
+    axes[2, 0].set_ylabel(r"$C_{33}(\tau)$")
     axes[0, 0].legend(frameon=False)
+    label_panels(axes)
     fig.tight_layout()
     fig.savefig(output_path, dpi=180)
     plt.close(fig)
@@ -442,7 +489,8 @@ def plot_theta_covariance_comparison(results, output_path):
 
 def plot_lif_summary(lyapunov, replica, covariance, output_path):
     """Summarize LIF network chaos and cavity-DMFT covariance predictions."""
-    fig, axes = plt.subplots(2, 2, figsize=(10.2, 7.4))
+    fig, axes = plt.subplots(2, 3, figsize=(15.0, 7.4))
+    axes[0, 2].set_visible(False)
     colors = plt.cm.viridis(np.linspace(0.15, 0.85, len(lyapunov["N"])))
     for N, mean, error, color in zip(
         lyapunov["N"],
@@ -518,14 +566,14 @@ def plot_lif_summary(lyapunov, replica, covariance, output_path):
 
     axes[1, 1].plot(
         covariance["tau_sim"],
-        covariance["C33_sim"],
+        _off_event_curve(covariance["Qoff_sim"]),
         color="k",
         lw=2.3,
         label="simulation",
     )
     axes[1, 1].plot(
-        covariance["tau_C33_stationary"],
-        covariance["C33_stationary"],
+        covariance["tau_Q_stationary"],
+        _off_event_curve(covariance["Qoff_stationary"]),
         color="C0",
         lw=1.9,
         ls="--",
@@ -533,11 +581,36 @@ def plot_lif_summary(lyapunov, replica, covariance, output_path):
     )
     axes[1, 1].set(
         xlabel=r"lag $\tau$",
-        ylabel=r"$C_{33}(\tau)$",
-        title="(d) Threshold-density covariance",
+        ylabel=r"$Q_{\nu,\mathrm{off}}(\tau)$",
+        title="(d) Distinct-event kernel",
     )
     axes[1, 1].set_xlim(0.0, covariance["tau_sim"][-1])
+    axes[1, 1].legend(frameon=False)
+
+    axes[1, 2].plot(
+        covariance["tau_sim"],
+        covariance["C33_sim"],
+        color="k",
+        lw=2.3,
+        label="simulation",
+    )
+    axes[1, 2].plot(
+        covariance["tau_C33_stationary"],
+        covariance["C33_stationary"],
+        color="C0",
+        lw=1.9,
+        ls="--",
+        label="event-DMFT",
+    )
+    axes[1, 2].set(
+        xlabel=r"lag $\tau$",
+        ylabel=r"$C_{33}(\tau)$",
+        title="(e) Threshold-density covariance",
+    )
+    axes[1, 2].set_xlim(0.0, covariance["tau_sim"][-1])
     for ax in axes.flat:
+        if not ax.get_visible():
+            continue
         ax.grid(alpha=0.18, which="both")
     fig.tight_layout()
     fig.savefig(output_path, dpi=180)
