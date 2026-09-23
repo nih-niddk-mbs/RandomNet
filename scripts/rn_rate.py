@@ -123,7 +123,7 @@ def sim_nonlinear_rate_network(
     dt=0.02,
     n_probe=128,
     tau_max=20.0,
-    lam=1,
+    lam=0,
     return_paths=False,
     rng=rng,
 ):
